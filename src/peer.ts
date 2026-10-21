@@ -28,11 +28,10 @@ import {
   encodePong,
   frameMessage,
   signRouted,
-  type HandshakePayload,
   type RoutedEnvelope,
   type RoutedTarget,
-  type WireMessage,
 } from "./protocol.ts";
+import type { HandshakePayload, WireMessage } from "./schemas.ts";
 
 export const peerMetrics = {
   bytesIn: Metric.counter("p2p_received_bytes"),

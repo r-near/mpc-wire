@@ -6,7 +6,14 @@ import bs58 from "bs58";
 import { b } from "@zorsh/zorsh";
 import { Clock, Deferred, Effect, Metric, Stream } from "effect";
 import { test } from "vite-plus/test";
-import { consume, parseSeed, metrics, type Request } from "../src/watch.ts";
+import {
+  observe,
+  observePeer,
+  parseSeed,
+  metrics,
+  type ReceiptObservation,
+} from "../src/network.ts";
+import { decodeArgs, signRequests, metrics as mpcMetrics, type SignRequest } from "../src/mpc.ts";
 import {
   encodeMessage,
   decodeMessage,
@@ -22,6 +29,17 @@ import {
 } from "../src/protocol.ts";
 import { openPeer, peerMetrics, type Peer, type PeerEvent } from "../src/peer.ts";
 
+import {
+  BlockBodySchema,
+  BlockSchema,
+  ChunkInnerSchema,
+  ChunkInnerV4,
+  ChunkResponseSchema,
+  ReceiptsSchema,
+  type Action,
+  type Receipt,
+} from "../src/schemas.ts";
+
 const cat = (...parts: Uint8Array[]) => Buffer.concat(parts);
 const u8 = (n: number) => Buffer.from([n]);
 const u32 = (n: number) => {
@@ -34,108 +52,119 @@ const u64 = (n: bigint) => {
   b.writeBigUInt64LE(n);
   return b;
 };
-const u128 = (n: bigint) => cat(u64(n), u64(0n));
 const bytes = (b: Uint8Array) => cat(u32(b.length), b);
-const str = (s: string) => bytes(Buffer.from(s));
 const hash = (b: Uint8Array) => createHash("sha256").update(b).digest();
 const zero = Buffer.alloc(32);
-const signature = cat(u8(0), Buffer.alloc(64));
 const contractId = "v1.signer-prod.testnet";
 const targetShardId = 4;
 const sourceShardId = 7n;
 const epochId = bs58.encode(zero);
-const signCall = (args: Uint8Array) => cat(u8(2), str("sign"), bytes(args), u64(30n), u128(1n));
+const signCall = (args: Uint8Array): Action => ({
+  FunctionCall: { methodName: "sign", args, gas: 30n, deposit: 1n },
+});
 const signAction = signCall(Buffer.from('{"request":{"payload":[1]}}'));
-const receipt = (receiver: string, actions: Uint8Array[] = [signAction]) =>
-  cat(
-    str("caller.testnet"),
-    str(receiver),
-    Buffer.alloc(32, receiver === contractId ? 1 : 2),
-    u8(5),
-    str("caller.testnet"),
-    u8(0),
-    u8(0),
-    zero,
-    u128(1n),
-    u32(0),
-    u32(0),
-    u32(actions.length),
-    ...actions,
-  );
+const receipt = (receiverId: string, actions: Action[] = [signAction]): Receipt => ({
+  predecessorId: "caller.testnet",
+  receiverId,
+  receiptId: Buffer.alloc(32, receiverId === contractId ? 1 : 2),
+  receipt: {
+    ActionV2: {
+      signerId: "caller.testnet",
+      refundTo: null,
+      signerPublicKey: { Ed25519: zero },
+      gasPrice: 1n,
+      outputDataReceivers: [],
+      inputDataIds: [],
+      actions,
+    },
+  },
+});
 
+// Values use the production layouts; hashes are derived independently below.
+// Frozen testnet captures separately guard against a shared encoder/decoder bug.
 function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
-  const list = cat(u32(receipts.length), ...receipts);
+  const list = ReceiptsSchema.serialize(receipts);
   const root = hash(hash(cat(u64(BigInt(targetShardId)), list)));
-  const chunkInner = cat(
-    u8(3),
-    zero,
-    zero,
-    zero,
-    zero,
-    u64(8n),
-    u64(42n),
-    u64(sourceShardId),
-    u64(0n),
-    u64(1000000n),
-    u128(0n),
-    root,
-    zero,
-    u32(0),
-    u8(0),
-    u128(0n),
-    u128(0n),
-    u64(0n),
-    Buffer.alloc(2),
-    u8(0),
-    u32(0),
-  );
-  const chunkHash = hash(cat(hash(chunkInner), zero));
-  const chunk = cat(u8(2), chunkInner, u64(42n), signature);
-  const body = cat(
-    u8(1),
-    u32(1),
-    chunk,
-    u32(0),
-    Buffer.alloc(32),
-    Buffer.alloc(64),
-    u32(1),
-    u32(0),
-  );
-  const lite = cat(u64(42n), zero, zero, zero, zero, u64(1000n), zero, zero);
-  const rest = cat(
-    hash(body),
-    zero,
-    zero,
-    zero,
-    zero,
-    zero,
-    u32(0),
-    u32(1),
-    u8(1),
-    u128(1n),
-    u128(2n),
-    u32(0),
-    zero,
-    zero,
-    u64(42n),
-    u64(41n),
-    u8(0),
-    u32(0),
-    u32(87),
-    u32(1),
-    bytes(Buffer.alloc(0)),
-  );
-  const blockBytes = cat(u8(3), u8(4), zero, lite, rest, signature, body);
-  const responseBytes = cat(
+  const inner: b.infer<typeof ChunkInnerV4> = {
+    prevBlockHash: zero,
+    prevStateRoot: zero,
+    prevOutcomeRoot: zero,
+    encodedMerkleRoot: zero,
+    encodedLength: 8n,
+    heightCreated: 42n,
+    shardId: sourceShardId,
+    prevGasUsed: 0n,
+    gasLimit: 1_000_000n,
+    prevBalanceBurnt: 0n,
+    receiptRoot: root,
+    txRoot: zero,
+    prevValidatorProposals: [],
+    congestionInfo: {
+      V1: { delayedReceiptsGas: 0n, bufferedReceiptsGas: 0n, receiptBytes: 0n, allowedShard: 0 },
+    },
+    bandwidthRequests: { V1: { requests: [] } },
+  };
+  const chunkHash = hash(cat(hash(ChunkInnerSchema.serialize({ V4: inner })), zero));
+  const signature = { Ed25519: Buffer.alloc(64) };
+  const body: b.infer<typeof BlockBodySchema> = {
+    V2: {
+      chunks: [{ V3: { inner: { V4: inner }, heightIncluded: 42n, signature } }],
+      challenges: [],
+      vrfValue: zero,
+      vrfProof: Buffer.alloc(64),
+      chunkEndorsements: [[]],
+    },
+  };
+  const blockBytes = BlockSchema.serialize({
+    V4: {
+      header: {
+        V5: {
+          prevHash: zero,
+          innerLite: {
+            height: 42n,
+            epochId: zero,
+            nextEpochId: zero,
+            prevStateRoot: zero,
+            prevOutcomeRoot: zero,
+            timestamp: 1000n,
+            nextBpHash: zero,
+            blockMerkleRoot: zero,
+          },
+          innerRest: {
+            blockBodyHash: hash(BlockBodySchema.serialize(body)),
+            prevChunkOutgoingReceiptsRoot: zero,
+            chunkHeadersRoot: zero,
+            chunkTxRoot: zero,
+            challengesRoot: zero,
+            randomValue: zero,
+            prevValidatorProposals: [],
+            chunkMask: [true],
+            nextGasPrice: 1n,
+            totalSupply: 2n,
+            challengesResult: [],
+            lastFinalBlock: zero,
+            lastDsFinalBlock: zero,
+            blockOrdinal: 42n,
+            prevHeight: 41n,
+            epochSyncDataHash: null,
+            approvals: [],
+            latestProtocolVersion: 87,
+            chunkEndorsements: [Buffer.alloc(0)],
+          },
+          signature,
+        },
+      },
+      body,
+    },
+  });
+  const responseBytes = ChunkResponseSchema.serialize({
     chunkHash,
-    u32(0),
-    u32(1),
-    list,
-    u64(sourceShardId),
-    u64(BigInt(targetShardId)),
-    u32(0),
-  );
-  const emptyResponse = cat(chunkHash, u32(0), u32(0));
+    parts: [],
+    receipts: [
+      { receipts, fromShardId: sourceShardId, toShardId: BigInt(targetShardId), proof: [] },
+    ],
+  });
+  const emptyResponse = ChunkResponseSchema.serialize({ chunkHash, parts: [], receipts: [] });
   const block: PeerEvent = {
     receivedAt: { unixMs: 1000, monotonicNs: 0n },
     type: "message",
@@ -162,7 +191,7 @@ function response(bodyBytes: Uint8Array, signatureValid = true): PeerEvent {
 }
 const collect = (events: PeerEvent[], expectedEpoch = epochId) =>
   Effect.gen(function* () {
-    const calls: Request[] = [];
+    const calls: SignRequest[] = [];
     const requested: (number | bigint)[] = [];
     let now = { unixMs: 1000, monotonicNs: 20_000_000n };
     const clock: Clock.Clock = {
@@ -184,18 +213,23 @@ const collect = (events: PeerEvent[], expectedEpoch = epochId) =>
         }),
       close: () => Effect.void,
     };
-    yield* consume(
+    yield* observePeer(
       peer,
-      { shard: targetShardId, epochId: expectedEpoch },
+      { accountId: contractId, shard: targetShardId, epochId: expectedEpoch },
       () => Effect.void,
-      (request) =>
+      "fixture",
+    ).pipe(
+      signRequests,
+      Stream.runForEach((request) =>
         Effect.sync(() => {
           calls.push(request);
         }),
-      "fixture",
-    ).pipe(Effect.provideService(Clock.Clock, clock));
+      ),
+      Effect.provideService(Clock.Clock, clock),
+    );
     return {
       calls,
+      invalid: yield* Metric.value(mpcMetrics.invalid),
       requested,
       fetched: yield* Metric.value(metrics.fetch),
       processed: yield* Metric.value(metrics.processing),
@@ -206,7 +240,7 @@ const collect = (events: PeerEvent[], expectedEpoch = epochId) =>
 
 test("proofs preserve multiple sign actions, suppress repeated responses, and record monotonic metrics", async () => {
   const f = fixture([
-    receipt(contractId, [signAction, cat(u8(3), u128(1n)), signAction]),
+    receipt(contractId, [signAction, { Transfer: { deposit: 1n } }, signAction]),
     receipt("other.testnet"),
   ]);
   const result = await Effect.runPromise(
@@ -256,11 +290,82 @@ test("Effect decodes sign JSON without imposing a contract version, with strict 
     [Buffer.from(JSON.stringify("x".repeat(16 * 1024 - 1))), /16 KiB/],
     [Buffer.from(JSON.stringify("鍵".repeat(6000))), /16 KiB/],
   ] as const) {
-    const f = fixture([receipt(contractId, [signCall(args)])]);
-    await assert.rejects(
-      Effect.runPromise(collect([f.block, response(f.responseBytes)])),
-      expected,
+    const f = fixture([receipt(contractId, [signCall(args), signAction])]);
+    const result = await Effect.runPromise(collect([f.block, response(f.responseBytes)]));
+    assert.deepEqual(
+      result.calls.map((call) => call.actionIndex),
+      [1],
     );
+    assert.equal(result.invalid.count, 1);
+    await assert.rejects(Effect.runPromise(decodeArgs(args)), expected);
+  }
+});
+
+test("network observations work for other accounts and leave action interpretation to the consumer", async () => {
+  const raw = receipt("other.testnet", [signCall(Buffer.from("not JSON"))]);
+  const f = fixture([receipt(contractId), raw]);
+  const peer: Peer = {
+    events: Stream.fromIterable([f.block, response(f.responseBytes)]),
+    requestBlock: () => Effect.void,
+    requestChunk: () => Effect.void,
+    close: () => Effect.void,
+  };
+  const observations = await Effect.runPromise(
+    observePeer(
+      peer,
+      {
+        accountId: "other.testnet",
+        shard: targetShardId,
+        epochId,
+      },
+      () => Effect.void,
+      "fixture",
+    ).pipe(Stream.runCollect),
+  );
+  assert.equal(observations.length, 1);
+  assert.deepEqual(
+    ReceiptsSchema.serialize(observations.map((item) => item.receipt)),
+    ReceiptsSchema.serialize([raw]),
+  );
+  assert.equal(observations[0]?.blockHeight, "42");
+  assert.deepEqual(
+    await Effect.runPromise(
+      signRequests(Stream.fromIterable(observations)).pipe(Stream.runCollect),
+    ),
+    [],
+  );
+});
+
+test("MPC deduplicates individual actions across peers, with fresh state per subscription", async () => {
+  const item: ReceiptObservation = {
+    receipt: receipt(contractId, [signAction, { Transfer: { deposit: 1n } }, signAction]),
+    blockHeight: "42",
+    peer: "first",
+    observedAt: "2026-10-21T00:00:00.000Z",
+    blockToReceiptMs: 12,
+  };
+  const stream = signRequests(Stream.make(item, { ...item, peer: "second" }));
+  for (let i = 0; i < 2; i++) {
+    const calls = await Effect.runPromise(stream.pipe(Stream.runCollect));
+    assert.deepEqual(
+      calls.map(({ actionIndex, peer }) => [actionIndex, peer]),
+      [
+        [0, "first"],
+        [2, "first"],
+      ],
+    );
+  }
+});
+
+test("network options fail before RPC for invalid accounts, peer counts and insecure endpoints", async () => {
+  const valid = { accountId: contractId, peers: 4, rpcUrl: "https://test.rpc.fastnear.com" };
+  for (const options of [
+    { ...valid, peers: 0 },
+    { ...valid, peers: 13 },
+    { ...valid, accountId: "BAD..testnet" },
+    { ...valid, rpcUrl: "http://localhost:3030" },
+  ]) {
+    await assert.rejects(Effect.runPromise(observe(options).pipe(Stream.runDrain)), /NetworkError/);
   }
 });
 
@@ -299,6 +404,14 @@ test("captured testnet data retains its MPC request, verifies its commitment, an
   assert.equal(
     hash(proofBytes).toString("hex"),
     "389665c2073f9ea83e04f5b4a06f6149fe7cbd71cbf6fecb4b24cad472c177d9",
+  );
+  assert.deepEqual(
+    Buffer.from(BlockSchema.serialize(BlockSchema.deserialize(blockBytes))),
+    blockBytes,
+  );
+  assert.deepEqual(
+    Buffer.from(ChunkResponseSchema.serialize(ChunkResponseSchema.deserialize(proofBytes))),
+    proofBytes,
   );
   const block = decodeBlock(blockBytes),
     response = decodeChunkResponse(proofBytes);
