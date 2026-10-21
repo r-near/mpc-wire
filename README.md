@@ -80,3 +80,5 @@ vp fmt
 ```
 
 Three implementation files in `src/`, one test file, and `vite.config.ts`. Uses Effect 4, published Zorsh 0.5.2, and near-kit for bootstrap. The pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) protobuf schema is in `vendor/` with its MIT license; captured testnet fixtures are in `fixtures/`.
+
+Effect schemas decode RPC responses, peer envelopes, and sign-call JSON. Zorsh handles Borsh; the cursor adds resource limits, records byte spans for proof hashes, and rejects trailing bytes. Zorsh's native [`@zorsh/effect`](https://github.com/r-near/zorsh/tree/main/packages/effect) package is still unpublished as of October 21, 2026, so the watcher keeps the published dependency. `protobufjs` reads NEAR's wire schema. Effect's [protobuf integration](https://github.com/Effect-TS/effect/blob/main/packages/effect/src/observability/OtlpSerialization.ts) is specific to OTLP telemetry; its `SchemaBinary` codec uses a different wire format.

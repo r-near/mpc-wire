@@ -94,6 +94,11 @@ const Protocol = Schema.Struct({
 const Network = Schema.Struct({
   active_peers: Schema.Array(Schema.Struct({ id: Schema.String, addr: Schema.String })),
 });
+const SignArgsBytes = Schema.Uint8Array.check(
+  Schema.isMaxLength(16 * 1024, { expected: "sign arguments at most 16 KiB" }),
+);
+const decodeArgsJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+const utf8 = new TextDecoder("utf-8", { fatal: true });
 const bootstrap = Effect.fn("Watch.bootstrap")(function* (rpcUrl: string) {
   const url = yield* checked(() => new URL(rpcUrl));
   if (url.protocol !== "https:" || url.username || url.password)
@@ -264,13 +269,10 @@ export const consume = Effect.fn("Watch.consume")(function* (
         "Action" in body ? body.Action.actions : "ActionV2" in body ? body.ActionV2.actions : [];
       for (const [actionIndex, action] of actions.entries()) {
         if (!("FunctionCall" in action) || action.FunctionCall.methodName !== "sign") continue;
-        const args = yield* checked((): unknown => {
-          if (action.FunctionCall.args.length > 16 * 1024)
-            throw new Error("sign arguments exceed 16 KiB");
-          return JSON.parse(
-            new TextDecoder("utf-8", { fatal: true }).decode(action.FunctionCall.args),
-          );
-        });
+        const args = yield* Schema.decodeEffect(SignArgsBytes)(action.FunctionCall.args).pipe(
+          Effect.flatMap((bytes) => checked(() => utf8.decode(bytes))),
+          Effect.flatMap(decodeArgsJson),
+        );
         yield* onRequest({
           receiptId: bs58.encode(receipt.receiptId),
           actionIndex,

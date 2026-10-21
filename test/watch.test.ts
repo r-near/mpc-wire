@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import bs58 from "bs58";
+import { b } from "@zorsh/zorsh";
 import { Clock, Deferred, Effect, Metric, Stream } from "effect";
 import { test } from "vite-plus/test";
 import { consume, parseSeed, metrics, type Request } from "../src/watch.ts";
@@ -43,13 +44,8 @@ const contractId = "v1.signer-prod.testnet";
 const targetShardId = 4;
 const sourceShardId = 7n;
 const epochId = bs58.encode(zero);
-const signAction = cat(
-  u8(2),
-  str("sign"),
-  bytes(Buffer.from('{"request":{"payload":[1]}}')),
-  u64(30n),
-  u128(1n),
-);
+const signCall = (args: Uint8Array) => cat(u8(2), str("sign"), bytes(args), u64(30n), u128(1n));
+const signAction = signCall(Buffer.from('{"request":{"payload":[1]}}'));
 const receipt = (receiver: string, actions: Uint8Array[] = [signAction]) =>
   cat(
     str("caller.testnet"),
@@ -242,6 +238,55 @@ test("missing proofs remain visible and never produce a call; epoch and signatur
   const corrupt = Buffer.from(f.responseBytes);
   corrupt[40] ^= 1;
   await assert.rejects(Effect.runPromise(collect([f.block, response(corrupt)])));
+});
+
+test("Effect decodes sign JSON without imposing a contract version, with strict UTF-8 and byte limits", async () => {
+  for (const value of [
+    null,
+    { request: { path: "鍵🔑", futureField: [true, 7] } },
+    "x".repeat(16 * 1024 - 2),
+  ]) {
+    const f = fixture([receipt(contractId, [signCall(Buffer.from(JSON.stringify(value)))])]);
+    const result = await Effect.runPromise(collect([f.block, response(f.responseBytes)]));
+    assert.deepEqual(result.calls[0]?.args, value);
+  }
+  for (const [args, expected] of [
+    [Buffer.from('{"request":'), /JSON/],
+    [Buffer.from([0x22, 0xff, 0x22]), /encoded data/],
+    [Buffer.from(JSON.stringify("x".repeat(16 * 1024 - 1))), /16 KiB/],
+    [Buffer.from(JSON.stringify("鍵".repeat(6000))), /16 KiB/],
+  ] as const) {
+    const f = fixture([receipt(contractId, [signCall(args)])]);
+    await assert.rejects(
+      Effect.runPromise(collect([f.block, response(f.responseBytes)])),
+      expected,
+    );
+  }
+});
+
+test("published Zorsh validates tags and UTF-8; the wire cursor adds resource and EOF limits", () => {
+  assert.throws(() => b.bool().deserialize(u8(2)), /bool/);
+  assert.throws(() => b.option(b.u8()).deserialize(u8(2)), /Option/);
+  assert.throws(() => b.string().deserialize(bytes(u8(0xff))), /encoded data/);
+  assert.equal(b.u8().deserialize(cat(u8(7), u8(99))), 7);
+  // Four bytes can request many zero-sized values despite a tiny input buffer.
+  assert.equal(b.vec(b.unit()).deserialize(u32(16_385)).length, 16_385);
+  assert.throws(() => decodeChunkResponse(Buffer.alloc(16 * 1024 * 1024 + 1)), /16 MiB/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(16_385))), /count/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(16_385))), /count/);
+  assert.throws(
+    () => decodeChunkResponse(cat(zero, u32(0), u32(1), u32(1), u32(1_048_577))),
+    /1 MiB/,
+  );
+  // Skipped chunk parts still have bounded vectors and valid Merkle direction tags.
+  const part = cat(zero, u32(1), u64(0n), bytes(Buffer.alloc(0)));
+  assert.throws(() => decodeChunkResponse(cat(part, u32(16_385))), /count/);
+  assert.throws(() => decodeChunkResponse(cat(part, u32(1), zero, u8(2))), /variant/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(0), u8(0))), /trailing/);
+  const f = fixture();
+  assert.ok(f.block.type === "message" && f.block.message.type === "block_response");
+  const blockBytes = f.block.message.payload.block.borsh;
+  assert.throws(() => decodeBlock(cat(blockBytes, u8(0))), /trailing/);
 });
 
 test("captured testnet data retains its MPC request, verifies its commitment, and rejects corrupt/trailing payloads", () => {
