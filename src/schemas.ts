@@ -1,6 +1,30 @@
 /** NEAR wire and RPC schemas. No transport, cryptography or MPC dependencies. */
 import { Borsh } from "@zorsh/effect";
-import { Schema } from "effect";
+import { Effect, Schema, SchemaIssue, SchemaTransformation } from "effect";
+
+export const wireLimits = { maxBytes: 16 * 1024 * 1024, maxItems: 16_384 };
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const encoder = new TextEncoder();
+// A Borsh string is a byte vector. Bound its encoded bytes before UTF-8 decoding.
+export const WireString = Borsh.Bytes.check(
+  Schema.isMaxLength(1_048_576, { expected: "string at most 1 MiB" }),
+).pipe(
+  Schema.decodeTo(
+    Schema.String.check(
+      Schema.makeFilter((value) => value.isWellFormed(), {
+        expected: "well-formed Unicode",
+      }),
+    ),
+    SchemaTransformation.transformEffect({
+      decode: (bytes) =>
+        Effect.try({
+          try: () => utf8.decode(bytes),
+          catch: () => new SchemaIssue.InvalidValue({ message: "invalid UTF-8" }),
+        }),
+      encode: (value) => Effect.succeed(encoder.encode(value)),
+    }),
+  ),
+);
 
 export const TESTNET_GENESIS = "FWJ9kR6KFWoyMoNjpLXXGHeuiy7tEY6GmoFeCA5yuc6b";
 export const Uint = Schema.Int.check(
@@ -89,6 +113,15 @@ export const chunkRequest = Schema.Struct({
   tracking_shards: Schema.ReadonlySet(Borsh.U64),
 });
 export const Hash = Borsh.fixedBytes(32);
+const Ed25519Key = Schema.TaggedUnion({ Ed25519: { value: Hash } });
+const Ed25519Signature = Schema.TaggedUnion({ Ed25519: { value: Borsh.fixedBytes(64) } });
+export const RoutedHeaderSchema = Schema.Struct({
+  target: Schema.TaggedUnion({ PeerId: { key: Ed25519Key }, Hash: { hash: Hash } }),
+  author: Ed25519Key,
+  signature: Ed25519Signature,
+  ttl: Borsh.U8,
+  bodyType: Borsh.U8,
+});
 const PublicKey = Schema.TaggedUnion({
   Ed25519: { value: Borsh.fixedBytes(32) },
   Secp256k1: { value: Borsh.fixedBytes(64) },
@@ -100,13 +133,13 @@ export const Signature = Schema.TaggedUnion({
   MlDsa65: { value: Borsh.fixedBytes(3309) },
 });
 const ValidatorStake = Schema.TaggedUnion({
-  V1: { accountId: Schema.String, publicKey: PublicKey, stake: Borsh.U128 },
+  V1: { accountId: WireString, publicKey: PublicKey, stake: Borsh.U128 },
 });
-const SlashedValidator = Schema.Struct({ accountId: Schema.String, isDoubleSign: Schema.Boolean });
+const SlashedValidator = Schema.Struct({ accountId: WireString, isDoubleSign: Schema.Boolean });
 const FunctionCallPermission = Schema.Struct({
   allowance: Schema.Option(Borsh.U128),
-  receiverId: Schema.String,
-  methodNames: Schema.Array(Schema.String),
+  receiverId: WireString,
+  methodNames: Schema.Array(WireString),
 });
 const GasKeyInfo = Schema.Struct({ balance: Borsh.U128, numNonces: Borsh.U16 });
 const AccessKeyPermission = Schema.TaggedUnion({
@@ -117,7 +150,7 @@ const AccessKeyPermission = Schema.TaggedUnion({
 });
 const GlobalContractIdentifier = Schema.TaggedUnion({
   CodeHash: { value: Hash },
-  AccountId: { value: Schema.String },
+  AccountId: { value: WireString },
 });
 const TransactionNonce = Schema.TaggedUnion({
   Nonce: { nonce: Borsh.U64 },
@@ -127,7 +160,7 @@ const basicActions = {
   CreateAccount: {},
   DeployContract: { code: Borsh.Bytes },
   FunctionCall: {
-    methodName: Schema.String,
+    methodName: WireString,
     args: Borsh.Bytes,
     gas: Borsh.U64,
     deposit: Borsh.U128,
@@ -139,7 +172,7 @@ const basicActions = {
     accessKey: Schema.Struct({ nonce: Borsh.U64, permission: AccessKeyPermission }),
   },
   DeleteKey: { publicKey: PublicKey },
-  DeleteAccount: { beneficiaryId: Schema.String },
+  DeleteAccount: { beneficiaryId: WireString },
 };
 const extendedActions = {
   DeployGlobalContract: {
@@ -160,18 +193,32 @@ const extendedActions = {
   WithdrawFromGasKey: { publicKey: PublicKey, amount: Borsh.U128 },
 };
 const UniversalStateInit = Schema.Struct({ stateInit: Borsh.Bytes, deposit: Borsh.U128 });
-// NonDelegateAction has the same tags as Action, but rejects tags 8 and 14.
-// Placeholder variants preserve the wire indices and Cursor rejects them.
+// NonDelegateAction uses Action's tags, with delegation (8 and 14) omitted.
 const NonDelegateAction = Schema.TaggedUnion({
   ...basicActions,
-  UnsupportedNestedDelegate: {},
   ...extendedActions,
-  UnsupportedNestedDelegateV2: {},
   UniversalStateInit: { ...UniversalStateInit.fields },
-});
+}).pipe(
+  Borsh.discriminants({
+    CreateAccount: 0,
+    DeployContract: 1,
+    FunctionCall: 2,
+    Transfer: 3,
+    Stake: 4,
+    AddKey: 5,
+    DeleteKey: 6,
+    DeleteAccount: 7,
+    DeployGlobalContract: 9,
+    UseGlobalContract: 10,
+    DeterministicStateInit: 11,
+    TransferToGasKey: 12,
+    WithdrawFromGasKey: 13,
+    UniversalStateInit: 15,
+  }),
+);
 const delegatePrefix = {
-  senderId: Schema.String,
-  receiverId: Schema.String,
+  senderId: WireString,
+  receiverId: WireString,
   actions: Schema.Array(NonDelegateAction),
 };
 const delegateTail = { maxBlockHeight: Borsh.U64, publicKey: PublicKey };
@@ -190,7 +237,7 @@ export const ActionSchema = Schema.TaggedUnion({
   },
   UniversalStateInit: { ...UniversalStateInit.fields },
 });
-const DataReceiver = Schema.Struct({ dataId: Hash, receiverId: Schema.String });
+const DataReceiver = Schema.Struct({ dataId: Hash, receiverId: WireString });
 const ActionReceiptTail = {
   signerPublicKey: PublicKey,
   gasPrice: Borsh.U128,
@@ -198,10 +245,10 @@ const ActionReceiptTail = {
   inputDataIds: Schema.Array(Hash),
   actions: Schema.Array(ActionSchema),
 };
-const ActionReceipt = Schema.Struct({ signerId: Schema.String, ...ActionReceiptTail });
+const ActionReceipt = Schema.Struct({ signerId: WireString, ...ActionReceiptTail });
 const ActionReceiptV2 = Schema.Struct({
-  signerId: Schema.String,
-  refundTo: Schema.Option(Schema.String),
+  signerId: WireString,
+  refundTo: Schema.Option(WireString),
   ...ActionReceiptTail,
 });
 const DataReceipt = Schema.Struct({ dataId: Hash, data: Schema.Option(Borsh.Bytes) });
@@ -212,8 +259,8 @@ const GlobalDistributionFields = {
   code: Borsh.Bytes,
 };
 export const ReceiptSchema = Schema.Struct({
-  predecessorId: Schema.String,
-  receiverId: Schema.String,
+  predecessorId: WireString,
+  receiverId: WireString,
   receiptId: Hash,
   receipt: Schema.TaggedUnion({
     Action: { ...ActionReceipt.fields },
@@ -283,7 +330,7 @@ export const InnerRestV6 = Schema.Struct({
   ...RestPrefix,
   ...RestMiddle,
   ...RestTail,
-  shardSplit: Schema.Option(Schema.Struct({ shardId: Borsh.U64, accountId: Schema.String })),
+  shardSplit: Schema.Option(Schema.Struct({ shardId: Borsh.U64, accountId: WireString })),
 });
 const ChunkInnerPrefix = {
   prevBlockHash: Hash,
@@ -320,7 +367,7 @@ export const ChunkInnerV5 = Schema.Struct({
   ...ChunkInnerPrefix,
   proposedSplit: Schema.Option(
     Schema.Struct({
-      boundaryAccount: Schema.String,
+      boundaryAccount: WireString,
       leftMemory: Borsh.U64,
       rightMemory: Borsh.U64,
     }),
@@ -331,54 +378,41 @@ export type Action = typeof ActionSchema.Type;
 export type Receipt = typeof ReceiptSchema.Type;
 export const ReceiptsSchema = Schema.Array(ReceiptSchema);
 export const ReceiptProofSchema = Schema.Struct({
-  receipts: ReceiptsSchema,
+  receipts: Borsh.withBytes(ReceiptsSchema),
   fromShardId: Borsh.U64,
   toShardId: Borsh.U64,
   proof: MerklePathSchema,
 });
 export const ChunkResponseSchema = Schema.Struct({
   chunkHash: Hash,
-  parts: Schema.Array(ChunkPartSchema),
+  // Our requests contain no part ordinals; reject unsolicited parts before decoding.
+  parts: Schema.Array(ChunkPartSchema).check(Schema.isMaxLength(0)),
   receipts: Schema.Array(ReceiptProofSchema),
 });
 
-// Unsupported placeholders retain nearcore's enum indices. The bounded decoder
-// rejects them; adding a version means defining its actual layout here.
+// Only supported NEAR versions have schemas; their wire tags stay explicit.
 export const ChunkInnerSchema = Schema.TaggedUnion({
-  UnsupportedV1: {},
-  UnsupportedV2: {},
-  UnsupportedV3: {},
   V4: { ...ChunkInnerV4.fields },
   V5: { ...ChunkInnerV5.fields },
-});
+}).pipe(Borsh.discriminants({ V4: 3, V5: 4 }));
 export const ChunkHeaderSchema = Schema.TaggedUnion({
-  UnsupportedV1: {},
-  UnsupportedV2: {},
-  V3: { inner: ChunkInnerSchema, heightIncluded: Borsh.U64, signature: Signature },
-});
-const headerFields = { prevHash: Hash, innerLite: InnerLite };
+  V3: { inner: Borsh.withBytes(ChunkInnerSchema), heightIncluded: Borsh.U64, signature: Signature },
+}).pipe(Borsh.discriminants({ V3: 2 }));
+const headerFields = { prevHash: Hash, innerLite: Borsh.withBytes(InnerLite) };
 export const BlockHeaderSchema = Schema.TaggedUnion({
-  UnsupportedV1: {},
-  UnsupportedV2: {},
-  UnsupportedV3: {},
-  UnsupportedV4: {},
-  V5: { ...headerFields, innerRest: InnerRestV5, signature: Signature },
-  V6: { ...headerFields, innerRest: InnerRestV6, signature: Signature },
-});
+  V5: { ...headerFields, innerRest: Borsh.withBytes(InnerRestV5), signature: Signature },
+  V6: { ...headerFields, innerRest: Borsh.withBytes(InnerRestV6), signature: Signature },
+}).pipe(Borsh.discriminants({ V5: 4, V6: 5 }));
 export const BlockBodySchema = Schema.TaggedUnion({
-  UnsupportedV1: {},
   V2: {
     chunks: Schema.Array(ChunkHeaderSchema),
-    // The reader supports only an empty deprecated challenges vector.
+    // Deprecated challenges must be empty.
     challenges: Schema.Array(Borsh.U8).check(Schema.isMaxLength(0)),
     vrfValue: Borsh.fixedBytes(32),
     vrfProof: Borsh.fixedBytes(64),
     chunkEndorsements: Schema.Array(Schema.Array(Schema.Option(Signature))),
   },
-});
+}).pipe(Borsh.discriminants({ V2: 1 }));
 export const BlockSchema = Schema.TaggedUnion({
-  UnsupportedV1: {},
-  UnsupportedV2: {},
-  UnsupportedV3: {},
-  V4: { header: BlockHeaderSchema, body: BlockBodySchema },
-});
+  V4: { header: BlockHeaderSchema, body: Borsh.withBytes(BlockBodySchema) },
+}).pipe(Borsh.discriminants({ V4: 3 }));

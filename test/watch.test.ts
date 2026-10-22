@@ -39,8 +39,12 @@ import {
   ChunkInnerV4,
   ChunkResponseSchema,
   Hash,
+  InnerLite,
+  InnerRestV5,
   ReceiptsSchema,
   Signature,
+  WireString,
+  wireLimits,
   type Action,
   type Receipt,
 } from "../src/schemas.ts";
@@ -59,6 +63,10 @@ const u64 = (n: bigint) => {
 };
 const bytes = (b: Uint8Array) => cat(u32(b.length), b);
 const hash = (b: Uint8Array) => createHash("sha256").update(b).digest();
+const captured = <A, I>(schema: Schema.Codec<A, I>, value: NoInfer<A>) => ({
+  value,
+  bytes: encode(schema, value),
+});
 const zero = Buffer.alloc(32);
 const contractId = "v1.signer-prod.testnet";
 const targetShardId = 4;
@@ -125,7 +133,7 @@ function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
     chunks: [
       {
         _tag: "V3" as const,
-        inner: { _tag: "V4" as const, ...inner },
+        inner: captured(ChunkInnerSchema, { _tag: "V4" as const, ...inner }),
         heightIncluded: 42n,
         signature,
       },
@@ -140,7 +148,7 @@ function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
     header: {
       _tag: "V5" as const,
       prevHash: zero,
-      innerLite: {
+      innerLite: captured(InnerLite, {
         height: 42n,
         epochId: zero,
         nextEpochId: zero,
@@ -149,8 +157,8 @@ function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
         timestamp: 1000n,
         nextBpHash: zero,
         blockMerkleRoot: zero,
-      },
-      innerRest: {
+      }),
+      innerRest: captured(InnerRestV5, {
         blockBodyHash: hash(encode(BlockBodySchema, body)),
         prevChunkOutgoingReceiptsRoot: zero,
         chunkHeadersRoot: zero,
@@ -170,16 +178,21 @@ function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
         approvals: [],
         latestProtocolVersion: 87,
         chunkEndorsements: [Buffer.alloc(0)],
-      },
+      }),
       signature,
     },
-    body,
+    body: captured(BlockBodySchema, body),
   });
   const responseBytes = encode(ChunkResponseSchema, {
     chunkHash,
     parts: [],
     receipts: [
-      { receipts, fromShardId: sourceShardId, toShardId: BigInt(targetShardId), proof: [] },
+      {
+        receipts: captured(ReceiptsSchema, receipts),
+        fromShardId: sourceShardId,
+        toShardId: BigInt(targetShardId),
+        proof: [],
+      },
     ],
   });
   const emptyResponse = encode(ChunkResponseSchema, { chunkHash, parts: [], receipts: [] });
@@ -432,28 +445,60 @@ test("native Effect schemas generate fixed-width hashes and signature arrays", a
   }
 });
 
-test("Effect Borsh validates tags, UTF-8 and EOF; preflight retains application resource limits", () => {
+test("Effect Borsh schemas enforce tags, UTF-8, EOF and allocation limits", () => {
   assert.throws(() => decode(Schema.Boolean, u8(2)), /Boolean|bool/i);
   assert.throws(() => decode(Schema.Option(Borsh.U8), u8(2)), /Option/);
   assert.throws(() => decode(Schema.String, bytes(u8(0xff))), /UTF-8/);
   assert.throws(() => decode(Borsh.U8, cat(u8(7), u8(99))), /Trailing/);
   assert.throws(() => decode(Schema.Array(Borsh.Unit), u32(16_385)), /zero-sized/);
-  assert.throws(() => decodeChunkResponse(Buffer.alloc(16 * 1024 * 1024 + 1)), /16 MiB/);
-  assert.throws(() => decodeChunkResponse(cat(zero, u32(16_385))), /count/);
-  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(16_385))), /count/);
+  assert.throws(() => decodeChunkResponse(Buffer.alloc(16 * 1024 * 1024 + 1)), /maxBytes/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(16_385))), /length of at most 0/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(16_385))), /maxItems/);
   assert.throws(
-    () => decodeChunkResponse(cat(zero, u32(0), u32(1), u32(1), u32(1_048_577))),
+    () => decodeChunkResponse(cat(zero, u32(0), u32(1), u32(1), u32(1_048_577), Buffer.alloc(128))),
     /1 MiB/,
   );
-  // Skipped chunk parts still have bounded vectors and valid Merkle direction tags.
-  const part = cat(zero, u32(1), u64(0n), bytes(Buffer.alloc(0)));
-  assert.throws(() => decodeChunkResponse(cat(part, u32(16_385))), /count/);
-  assert.throws(() => decodeChunkResponse(cat(part, u32(1), zero, u8(2))), /variant/);
-  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(0), u8(0))), /trailing/);
+  // Receipts-only requests never ask for chunk parts. Reject even their count prefix.
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(1))), /length of at most 0/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(0), u8(0))), /Trailing/);
   const f = fixture();
   assert.ok(f.block.type === "message" && f.block.message.type === "block_response");
   const blockBytes = f.block.message.payload.block.borsh;
-  assert.throws(() => decodeBlock(cat(blockBytes, u8(0))), /trailing/);
+  assert.throws(() => decodeBlock(cat(blockBytes, u8(0))), /Trailing/);
+});
+
+test("string schemas bound UTF-8 bytes before decoding and preserve Borsh text exactly", () => {
+  for (const value of ["sign", "\uFEFFleading BOM", "café 🦀", "a".repeat(1_048_576)]) {
+    const encoded = encode(WireString, value);
+    assert.deepEqual(encoded, encode(Schema.String, value));
+    assert.equal(decode(WireString, encoded), value);
+  }
+  assert.throws(() => decode(WireString, u32(1_048_577)), /1 MiB/);
+  assert.throws(() => decode(WireString, bytes(u8(0xff))), /UTF-8/);
+  assert.throws(() => encode(WireString, "\uD800"), /well-formed Unicode/);
+  assert.throws(() => encode(WireString, "é".repeat(524_289)), /1 MiB/);
+});
+
+test("native collection limits reject prefixes early and share a budget across nested vectors", () => {
+  const oneItem = Schema.Array(Borsh.U32).check(Schema.isMaxLength(1));
+  assert.throws(() => decode(oneItem, u32(4)), /got 4 items/);
+  const nested = Schema.Array(Schema.Array(Borsh.U8));
+  const codec = Borsh.toCodec(nested, { ...wireLimits, maxItems: 3 });
+  // Two outer entries plus one inner entry exhaust the budget before the second payload.
+  const prefix = cat(u32(2), u32(1), u8(7), u32(1));
+  assert.throws(() => Schema.decodeSync(codec)(prefix), /maxItems \(3\)/);
+  for (const tag of [0, 1, 2]) {
+    assert.throws(() => decode(BlockSchema, u8(tag)), /Invalid enum tag/);
+    assert.throws(() => decode(ChunkInnerSchema, u8(tag)), /Invalid enum tag/);
+  }
+  const nestedDelegate = cat(
+    u8(8),
+    encode(WireString, "a"),
+    encode(WireString, "b"),
+    u32(1),
+    u8(8),
+  );
+  assert.throws(() => decode(ActionSchema, nestedDelegate), /Invalid enum tag 8/);
 });
 
 test("captured testnet data retains its MPC request, verifies its commitment, and rejects corrupt/trailing payloads", () => {
@@ -481,6 +526,12 @@ test("captured testnet data retains its MPC request, verifies its commitment, an
   const proof = response.receipts[0];
   assert.ok(proof);
   assert.equal(verifyReceiptProof(proof, header.receiptRoot, header.shardId, 5n), true);
+  const received = Buffer.from(proofBytes);
+  const copied = decodeChunkResponse(received).receipts[0];
+  assert.ok(copied);
+  received.fill(0);
+  assert.deepEqual(copied.receiptBytes, proof.receiptBytes);
+  assert.equal(verifyReceiptProof(copied, header.receiptRoot, header.shardId, 5n), true);
   assert.equal(proof.receipts[0]?.receiverId, contractId);
   assert.equal(
     bs58.encode(proof.receipts[0].receiptId),

@@ -2,7 +2,7 @@
 
 A read-only watcher for `sign` calls to NEAR's `v1.signer-prod.testnet` MPC contract. Connects to up to 12 peers and prints the request arguments without running a NEAR node.
 
-This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `4a54b28`](https://github.com/r-near/zorsh/tree/4a54b28775b58f380d72f4426a471f2b23c37f3b/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
+This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `541e03f`](https://github.com/r-near/zorsh/tree/541e03f91bc51d9de59606e1fa60ecd8ebdf40e8/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
 
 ## Run
 
@@ -25,41 +25,41 @@ Request lines are JSON, including receipt ID, action index, caller, arguments, b
 
 ## Sample run
 
-Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and the earlier Zorsh Effect build at `ec3938f`. All 12 peers became active. The run observed two distinct sign requests and checked 3,093 receipt proofs; eleven candidates failed connection, handshake or epoch checks. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
+Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and Zorsh main at `541e03f`. All 12 peers became active. The run observed two distinct sign requests and checked 2,105 receipt proofs; four candidates failed connection or handshake checks. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
 
 ```text
 connecting to up to 12 testnet peers; watching v1.signer-prod.testnet
 {
   "event": "sign-request",
-  "receiptId": "7oQHnDgV12rDTLHB6Yejz8TZoUoWP2as761tfV4YKuSa",
+  "receiptId": "2L6Vx4UrcyWJSBJ9B2d1SNW76xdwwNgp2nh7XjX9RRkV",
   "actionIndex": 0,
   "caller": "tx-bench.testnet",
   "args": {
     "request": {
-      "domain_id": 0,
+      "domain_id": 1,
       "path": "",
       "payload_v2": {
-        "Ecdsa": "6803262d7828f32d50c5ea737fd64baed20c2e0dc094b65a01e2f83f12cabd98"
+        "Eddsa": "ccf1efa2f508e0fb443e05376ee1ca21006ab3557975142a9da02506dd50644c"
       }
     }
   },
-  "blockHeight": "274199451",
-  "peer": "185.44.207.120",
-  "observedAt": "2026-10-22T04:55:57.877Z",
-  "blockToRequestMs": 177.193292
+  "blockHeight": "274269922",
+  "peer": "34.34.24.155",
+  "observedAt": "2026-10-22T16:03:27.487Z",
+  "blockToRequestMs": 172.266875
 }
 {
   "event": "metrics",
-  "at": "2026-10-22T04:56:25.693Z",
+  "at": "2026-10-22T16:03:54.108Z",
   "metrics": [
     {"name": "fresh_peers","type": "Gauge","value": 12},
-    {"name": "peer_failures","type": "Counter","count": 11},
-    {"name": "receipt_proofs","type": "Counter","count": 3093},
-    {"name": "receipt_fetch_ms","type": "Histogram","count": 3093,"min": 38.108291,"max": 753.670583,"sum": 584329.9487999995},
-    {"name": "response_processing_ms","type": "Histogram","count": 3093,"min": 0.08625,"max": 4.39625,"sum": 1168.8955550000019},
-    {"name": "missing_proofs","type": "Counter","count": 4237},
+    {"name": "peer_failures","type": "Counter","count": 4},
+    {"name": "receipt_proofs","type": "Counter","count": 2105},
+    {"name": "receipt_fetch_ms","type": "Histogram","count": 2105,"min": 19.909042,"max": 557.037542,"sum": 374829.44544499967},
+    {"name": "response_processing_ms","type": "Histogram","count": 2105,"min": 0.080458,"max": 3.445458,"sum": 611.6430219999988},
+    {"name": "missing_proofs","type": "Counter","count": 5355},
     {"name": "sign_requests","type": "Counter","count": 2},
-    {"name": "block_to_request_ms","type": "Histogram","count": 2,"min": 177.193292,"max": 184.527292,"sum": 361.72058400000003}
+    {"name": "block_to_request_ms","type": "Histogram","count": 2,"min": 172.266875,"max": 179.49725,"sum": 351.76412500000004}
   ]
 }
 ```
@@ -71,6 +71,8 @@ Read-only RPC supplies the initial testnet identity, shard layout, and peer addr
 Receipt membership is checked against the received block's commitments. This client does not validate consensus or execute the contract. A request can still fail execution. It does not obtain continuation IDs or completed signatures.
 
 This is a bounded experiment: no backfill, reconnect loop, or completeness guarantee. Missing proofs and dropped peers remain visible in the metrics. An epoch change stops that peer's observer; restart to refresh the shard layout. Twelve connections can include peers operated by the same provider. Slow consumers apply backpressure; a peer disconnects if its bounded incoming queue fills. Invalid sign arguments are skipped with a warning and an `invalid_sign_requests` counter, without disconnecting the peer.
+
+Each Borsh message is limited to 16 MiB and 16,384 collection items in total, including nested collections. Strings are limited to 1 MiB of UTF-8 bytes. These are watcher limits, not NEAR protocol limits. Receipt-only requests reject responses containing unsolicited chunk parts.
 
 ## Develop
 
@@ -111,8 +113,8 @@ Each observation includes the raw decoded receipt, block height, source peer and
 
 Synthetic fixtures use the same native Effect schemas as the decoder. Seeded `Arbitrary.schema` tests generate sign actions, hashes and fixed-length signature arrays, then round-trip their wire encoding. The fixture builders compute the dependent receipt, chunk and block hashes. The two captured files in `fixtures/` stay fixed: their hashes and exact round trips catch compatibility mistakes that a generated fixture could share with the decoder. Add captures when supporting new wire versions; do not regenerate the historical ones.
 
-Uses Effect 4 and near-kit for bootstrap. `protobufjs` reads the pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) schema in `vendor/`. Zorsh's Effect codecs validate Borsh tags, UTF-8 and exact input consumption. The cursor still limits item counts, string bytes and structural complexity before allocation, and locates the original byte spans needed by proof checks. It reads layout annotations from the pinned package; use the bounded protocol decoders for network input.
+Uses Effect 4 and near-kit for bootstrap. `protobufjs` reads the pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) schema in `vendor/`. Zorsh decodes the Borsh schemas with `maxBytes` and `maxItems`; native length checks reject unwanted data before allocation. `withBytes` retains the received receipt, header and body bytes for proof hashes, while prefix decoding separates routing headers from their bodies. There is no custom Borsh cursor or schema walker.
 
-The trial tarball was built from unmodified commit `4a54b28775b58f380d72f4426a471f2b23c37f3b` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `f4e22e3a9d0ef526132661d833cbb7ab375301374eb6bba5db2100d143bcdeeb`.
+The trial tarball was built from unmodified commit `541e03f91bc51d9de59606e1fa60ecd8ebdf40e8` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `006c399217e874807f5dec7667611935edea86dd6e8c6bd5eab9a5d605282e8e`.
 
-The fixture-generation fixes are included: `fixedBytes` and untransformed `fixedArray` now generate values of the required length. Native strings can still include lone UTF-16 surrogates that Borsh correctly rejects; the sign-action generator narrows the method to `"sign"`. The public decoder still lacks byte-span capture and item/work limits before allocation, so these fixes do not replace the cursor.
+`WireString` is an Effect transformation from bounded bytes to strict UTF-8. This keeps the byte limit ahead of string decoding, preserves leading BOMs and rejects lone UTF-16 surrogates on encode. The layouts are fixed and nonrecursive; the shared item budget replaces the old parser's structural-work counter. Tests build captured fields from typed values and their schema encoding, so `withBytes` also checks that those values and bytes agree.

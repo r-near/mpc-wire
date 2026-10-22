@@ -12,21 +12,15 @@ import { readFileSync } from "node:fs";
 import bs58 from "bs58";
 import protobuf from "protobufjs";
 import { Borsh } from "@zorsh/effect";
-import { Schema, type SchemaAST } from "effect";
+import { Schema } from "effect";
 import {
   edgeSchema,
   KnownWireMessage,
   chunkRequest,
-  Hash,
-  Signature,
-  ReceiptSchema,
-  MerklePathSchema,
-  ChunkPartSchema,
-  InnerLite,
-  InnerRestV5,
-  InnerRestV6,
-  ChunkInnerV4,
-  ChunkInnerV5,
+  BlockSchema,
+  ChunkResponseSchema,
+  RoutedHeaderSchema,
+  wireLimits,
   type MerklePath,
   type RoutedV3Payload,
   type WireMessage,
@@ -274,29 +268,24 @@ export function signRouted(
 
 /** Parse only the fixed routing envelope; the body remains untrusted Borsh bytes. */
 export function decodeRouted(bytes: Uint8Array): RoutedEnvelope {
-  const cursor = new Cursor(bytes);
-  const targetType = cursor.byte();
-  let target: RoutedTarget;
-  if (targetType === 0) {
-    if (cursor.byte() !== 0) throw new Error("unsupported routed target key type");
-    target = { type: "peer_id", bytes: cursor.take(32) };
-  } else if (targetType === 1) {
-    target = { type: "hash", bytes: cursor.take(32) };
-  } else throw new Error("invalid routed target tag");
-  if (cursor.byte() !== 0) throw new Error("unsupported routed author key type");
-  const author = cursor.take(32);
-  if (cursor.byte() !== 0) throw new Error("unsupported routed signature type");
-  const signature = cursor.take(64);
-  const ttl = cursor.byte();
-  const bodyType = cursor.byte();
-  const bodyBytes = bytes.subarray(cursor.offset);
-  const hash = routedHash(target, author, bytes.subarray(cursor.offset - 1));
+  if (bytes.byteLength > wireLimits.maxBytes) {
+    throw new Error("routed payload exceeds 16 MiB");
+  }
+  const { value, offset } = decodeRoutedHeader(bytes);
+  const target: RoutedTarget =
+    value.target._tag === "PeerId"
+      ? { type: "peer_id", bytes: value.target.key.value }
+      : { type: "hash", bytes: value.target.hash };
+  const author = value.author.value;
+  const signature = value.signature.value;
+  const bodyBytes = bytes.subarray(offset);
+  const hash = routedHash(target, author, bytes.subarray(offset - 1));
   return {
     target,
     author,
     signature,
-    ttl,
-    bodyType,
+    ttl: value.ttl,
+    bodyType: value.bodyType,
     bodyBytes,
     hash,
     signatureValid: verifyEd25519(author, hash, signature),
@@ -375,143 +364,12 @@ export function encodePong(nonce: bigint, source: Uint8Array): Buffer {
   ]);
 }
 
-const MAX_PAYLOAD = 16 * 1024 * 1024;
-const MAX_ITEMS = 16_384;
-const MAX_NODES = 200_000;
-
-// The public codec enforces EOF/tags/UTF-8. Preflight still bounds allocations and
-// locates original wire spans. Layout annotations are pinned with the trial package.
+// The schemas own Borsh layouts, limits and captured bytes; no parallel parser.
 export const encode = <A, I>(schema: Schema.Codec<A, I>, value: NoInfer<A>) =>
-  Schema.encodeSync(Borsh.toCodec(schema))(value);
+  Schema.encodeSync(Borsh.toCodec(schema, wireLimits))(value);
 export const decode = <A, I>(schema: Schema.Codec<A, I>, bytes: Uint8Array) =>
-  Schema.decodeSync(Borsh.toCodec(schema))(bytes);
-
-class Cursor {
-  readonly bytes: Uint8Array;
-  offset = 0;
-  private nodes = 0;
-  constructor(bytes: Uint8Array) {
-    this.bytes = bytes;
-    if (bytes.byteLength > MAX_PAYLOAD) throw new Error("borsh payload exceeds 16 MiB");
-  }
-  take(size: number): Uint8Array {
-    if (!Number.isSafeInteger(size) || size < 0 || size > this.bytes.length - this.offset) {
-      throw new Error(`truncated borsh payload at offset ${this.offset}`);
-    }
-    const result = this.bytes.subarray(this.offset, this.offset + size);
-    this.offset += size;
-    return result;
-  }
-  byte(): number {
-    return this.take(1)[0]!;
-  }
-  count(label: string): number {
-    const value = this.u32();
-    if (value > MAX_ITEMS) throw new Error(`${label} count ${value} exceeds ${MAX_ITEMS}`);
-    return value;
-  }
-  u32(): number {
-    const bytes = this.take(4);
-    return new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
-  }
-  scan(schema: Schema.Top): void {
-    this.walk(Schema.toEncoded(schema).ast);
-  }
-  private walk(ast: SchemaAST.AST, depth = 0, omitTag = false): void {
-    if (++this.nodes > MAX_NODES || depth > 64) throw new Error("borsh structure limit exceeded");
-    const nested = (child: SchemaAST.AST) => this.walk(child, depth + 1);
-    let layout = ast.annotations?.["@zorsh/effect/borsh/layout"];
-    const checks = [...(ast.checks ?? [])];
-    for (let check = checks.pop(); check !== undefined; check = checks.pop()) {
-      layout ??= check.annotations?.["@zorsh/effect/borsh/layout"];
-      if (check._tag === "FilterGroup") checks.push(...check.checks);
-    }
-    if (typeof layout === "object" && layout !== null && "kind" in layout) {
-      if (layout.kind === "integer" && "bits" in layout && typeof layout.bits === "number") {
-        this.take(layout.bits / 8);
-        return;
-      }
-      if (layout.kind === "fixedBytes" && "length" in layout && typeof layout.length === "number") {
-        this.take(layout.length);
-        return;
-      }
-      throw new Error("unsupported preflight layout annotation");
-    }
-    switch (ast._tag) {
-      case "Boolean":
-        if (this.byte() > 1) throw new Error("invalid bool tag");
-        return;
-      case "String": {
-        const length = this.u32();
-        if (length > 1_048_576) throw new Error("borsh string exceeds 1 MiB");
-        this.take(length);
-        return;
-      }
-      case "Objects":
-        for (const field of ast.propertySignatures) {
-          if (omitTag && field.name === "_tag") continue;
-          nested(field.type);
-        }
-        return;
-      case "Arrays": {
-        if (ast.rest.length === 0) {
-          for (const item of ast.elements) nested(item);
-          return;
-        }
-        if (ast.elements.length || ast.rest.length !== 1)
-          throw new Error("unsupported preflight tuple");
-        const count = this.count("vector");
-        for (let i = 0; i < count; i++) nested(ast.rest[0]);
-        return;
-      }
-      case "Declaration": {
-        const representation = ast.annotations?.representation;
-        const id =
-          typeof representation === "object" && representation !== null && "id" in representation
-            ? representation.id
-            : undefined;
-        if (id === "effect/schema/Uint8Array") {
-          this.take(this.u32());
-          return;
-        }
-        if (id === "effect/schema/Option") {
-          const tag = this.byte();
-          if (tag > 1) throw new Error("invalid Option tag");
-          if (tag === 1) nested(ast.typeParameters[0]);
-          return;
-        }
-        throw new Error(`unsupported preflight declaration ${String(id)}`);
-      }
-      case "Union": {
-        const tag = this.byte();
-        const member = ast.types[tag];
-        const label =
-          member?._tag === "Objects"
-            ? member.propertySignatures.find((field) => field.name === "_tag")?.type
-            : undefined;
-        if (
-          label?._tag !== "Literal" ||
-          typeof label.literal !== "string" ||
-          label.literal.startsWith("Unsupported")
-        )
-          throw new Error(`unsupported borsh enum variant ${tag}`);
-        this.walk(member, depth + 1, true);
-        return;
-      }
-      default:
-        throw new Error(`unsupported preflight schema ${ast._tag}`);
-    }
-  }
-  read<A, I>(schema: Schema.Codec<A, I>): A {
-    const start = this.offset;
-    this.scan(schema);
-    return decode(schema, this.bytes.subarray(start, this.offset));
-  }
-  end(): void {
-    if (this.offset !== this.bytes.length)
-      throw new Error(`trailing borsh bytes: ${this.bytes.length - this.offset}`);
-  }
-}
+  Schema.decodeSync(Borsh.toCodec(schema, wireLimits))(bytes);
+const decodeRoutedHeader = Borsh.decodePrefixSync(RoutedHeaderSchema, wireLimits);
 
 function combine(a: Uint8Array, c: Uint8Array): Uint8Array {
   return sha256(Buffer.concat([a, c]));
@@ -520,30 +378,16 @@ function equal(a: Uint8Array, c: Uint8Array): boolean {
   return a.length === c.length && timingSafeEqual(a, c);
 }
 
-function readReceipts(cursor: Cursor) {
-  const count = cursor.count("receipts");
-  return Array.from({ length: count }, () => cursor.read(ReceiptSchema));
-}
 export function decodeChunkResponse(bytes: Uint8Array) {
-  const cursor = new Cursor(bytes);
-  const chunkHash = cursor.read(Hash);
-  // We request receipts only. Skip any parts without allocating decoded objects.
-  cursor.scan(Schema.Array(ChunkPartSchema));
-  const count = cursor.count("receipt proofs");
-  const receipts = Array.from({ length: count }, () => {
-    const start = cursor.offset;
-    const receipts = readReceipts(cursor);
-    const receiptBytes = cursor.bytes.subarray(start, cursor.offset);
-    return {
-      receipts,
-      receiptBytes,
-      fromShardId: cursor.read(Borsh.U64),
-      toShardId: cursor.read(Borsh.U64),
-      proof: cursor.read(MerklePathSchema),
-    };
-  });
-  cursor.end();
-  return { chunkHash, receipts };
+  const response = decode(ChunkResponseSchema, bytes);
+  return {
+    chunkHash: response.chunkHash,
+    receipts: response.receipts.map(({ receipts, ...proof }) => ({
+      ...proof,
+      receipts: receipts.value,
+      receiptBytes: receipts.bytes,
+    })),
+  };
 }
 export type DecodedReceiptProof = ReturnType<typeof decodeChunkResponse>["receipts"][number];
 
@@ -583,73 +427,41 @@ export function verifyMerklePath(
     hash = item.direction._tag === "Left" ? combine(item.hash, hash) : combine(hash, item.hash);
   return equal(hash, root);
 }
-function readChunkHeader(cursor: Cursor) {
-  const version = cursor.byte();
-  if (version !== 2)
-    throw new Error(`unsupported chunk header version ${version}; expected V3 tag 2`);
-  const start = cursor.offset;
-  const innerVersion = cursor.byte();
-  if (innerVersion !== 3 && innerVersion !== 4)
-    throw new Error(`unsupported chunk inner version ${innerVersion}; expected V4/V5`);
-  const inner = innerVersion === 3 ? cursor.read(ChunkInnerV4) : cursor.read(ChunkInnerV5);
-  const innerHash = sha256(cursor.bytes.subarray(start, cursor.offset));
-  const heightIncluded = cursor.read(Borsh.U64);
-  const signature = cursor.read(Signature);
-  return {
-    ...inner,
-    version: version + 1,
-    innerVersion: innerVersion + 1,
+export function decodeBlock(bytes: Uint8Array) {
+  const { header, body } = decode(BlockSchema, bytes);
+  const lite = header.innerLite.value;
+  const rest = header.innerRest.value;
+  const bodyHash = sha256(body.bytes);
+  if (!equal(bodyHash, rest.blockBodyHash)) {
+    throw new Error("block body hash mismatch");
+  }
+  const chunks = body.value.chunks.map(({ inner, heightIncluded, signature }) => ({
+    ...inner.value,
+    version: 3,
+    innerVersion: inner.value._tag === "V4" ? 4 : 5,
     heightIncluded,
     signature,
-    chunkHash: combine(innerHash, inner.encodedMerkleRoot),
-  };
-}
-export type ChunkHeader = ReturnType<typeof readChunkHeader>;
-export function decodeBlock(bytes: Uint8Array) {
-  const cursor = new Cursor(bytes);
-  const version = cursor.byte();
-  if (version !== 3)
-    throw new Error(`unsupported block version ${version}; expected BlockV4 tag 3`);
-  const headerVersion = cursor.byte();
-  if (headerVersion !== 4 && headerVersion !== 5)
-    throw new Error(`unsupported block header version ${headerVersion}; expected V5/V6`);
-  const prevHash = cursor.read(Hash);
-  const liteStart = cursor.offset;
-  const lite = cursor.read(InnerLite);
-  const liteHash = sha256(cursor.bytes.subarray(liteStart, cursor.offset));
-  const restStart = cursor.offset;
-  const rest = headerVersion === 4 ? cursor.read(InnerRestV5) : cursor.read(InnerRestV6);
-  const restHash = sha256(cursor.bytes.subarray(restStart, cursor.offset));
-  const signature = cursor.read(Signature);
-  const bodyStart = cursor.offset;
-  const bodyVersion = cursor.byte();
-  if (bodyVersion !== 1)
-    throw new Error(`unsupported block body version ${bodyVersion}; expected V2 tag 1`);
-  const count = cursor.count("chunk headers");
-  const chunks = Array.from({ length: count }, () => readChunkHeader(cursor));
-  if (cursor.count("challenges") !== 0)
-    throw new Error("nonempty deprecated challenges are unsupported");
-  const vrfValue = cursor.read(Borsh.fixedBytes(32));
-  const vrfProof = cursor.read(Borsh.fixedBytes(64));
-  const chunkEndorsements = cursor.read(Schema.Array(Schema.Array(Schema.Option(Signature))));
-  cursor.end();
-  const bodyHash = sha256(bytes.subarray(bodyStart));
-  if (!equal(bodyHash, rest.blockBodyHash)) throw new Error("block body hash mismatch");
+    chunkHash: combine(sha256(inner.bytes), inner.value.encodedMerkleRoot),
+  }));
   return {
-    hash: combine(combine(liteHash, restHash), prevHash),
+    hash: combine(
+      combine(sha256(header.innerLite.bytes), sha256(header.innerRest.bytes)),
+      header.prevHash,
+    ),
     height: lite.height,
-    prevHash,
+    prevHash: header.prevHash,
     lastFinalBlock: rest.lastFinalBlock,
     timestamp: lite.timestamp,
-    headerVersion: headerVersion + 1,
+    headerVersion: header._tag === "V5" ? 5 : 6,
     protocolVersion: rest.latestProtocolVersion,
     chunks,
-    signature,
+    signature: header.signature,
     innerLite: lite,
     innerRest: rest,
     bodyHash,
-    vrfValue,
-    vrfProof,
-    chunkEndorsements,
+    vrfValue: body.value.vrfValue,
+    vrfProof: body.value.vrfProof,
+    chunkEndorsements: body.value.chunkEndorsements,
   };
 }
+export type ChunkHeader = ReturnType<typeof decodeBlock>["chunks"][number];
