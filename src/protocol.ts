@@ -11,8 +11,8 @@ import {
 import { readFileSync } from "node:fs";
 import bs58 from "bs58";
 import protobuf from "protobufjs";
-import { b, type Schema as BorshSchema } from "@zorsh/zorsh";
-import { Schema } from "effect";
+import { Borsh } from "@zorsh/effect";
+import { Schema, type SchemaAST } from "effect";
 import {
   edgeSchema,
   KnownWireMessage,
@@ -55,7 +55,8 @@ export function edgeHash(ours: Uint8Array, theirs: Uint8Array, nonce: bigint): B
   const left = publicKeyBorsh(ours);
   const right = publicKeyBorsh(theirs);
   return sha256(
-    edgeSchema.serialize(
+    encode(
+      edgeSchema,
       Buffer.compare(left, right) < 0
         ? { first: left, second: right, nonce }
         : { first: right, second: left, nonce },
@@ -105,7 +106,7 @@ export class PeerIdentity {
 
   partialEdge(theirs: Uint8Array, nonce: bigint): Buffer {
     return Buffer.concat([
-      b.u64().serialize(nonce),
+      encode(Borsh.U64, nonce),
       this.signBorsh(edgeHash(this.publicKey, theirs, nonce)),
     ]);
   }
@@ -358,7 +359,7 @@ function uint64(value: bigint | number): bigint {
 export function encodeReceiptRequest(hash: Uint8Array | string, shardId: number | bigint): Buffer {
   return Buffer.concat([
     Buffer.from([11]),
-    chunkRequest.serialize({
+    encode(chunkRequest, {
       chunk_hash: bytes32(hash),
       part_ords: [],
       tracking_shards: new Set([uint64(shardId)]),
@@ -369,7 +370,7 @@ export function encodeReceiptRequest(hash: Uint8Array | string, shardId: number 
 export function encodePong(nonce: bigint, source: Uint8Array): Buffer {
   return Buffer.concat([
     Buffer.from([15]),
-    b.u64().serialize(uint64(nonce)),
+    encode(Borsh.U64, uint64(nonce)),
     publicKeyBorsh(source),
   ]);
 }
@@ -378,9 +379,13 @@ const MAX_PAYLOAD = 16 * 1024 * 1024;
 const MAX_ITEMS = 16_384;
 const MAX_NODES = 200_000;
 
-// Zorsh 0.5.2 validates Borsh tags and UTF-8. This preflight adds our resource
-// limits and locates field boundaries; end() rejects trailing message bytes.
-type Shape = { type: string; options: unknown };
+// The public codec enforces EOF/tags/UTF-8. Preflight still bounds allocations and
+// locates original wire spans. Layout annotations are pinned with the trial package.
+export const encode = <A, I>(schema: Schema.Codec<A, I>, value: NoInfer<A>) =>
+  Schema.encodeSync(Borsh.toCodec(schema))(value);
+export const decode = <A, I>(schema: Schema.Codec<A, I>, bytes: Uint8Array) =>
+  Schema.decodeSync(Borsh.toCodec(schema))(bytes);
+
 class Cursor {
   readonly bytes: Uint8Array;
   offset = 0;
@@ -401,68 +406,106 @@ class Cursor {
     return this.take(1)[0]!;
   }
   count(label: string): number {
-    const value = b.u32().deserialize(this.take(4));
+    const value = this.u32();
     if (value > MAX_ITEMS) throw new Error(`${label} count ${value} exceeds ${MAX_ITEMS}`);
     return value;
   }
-  scan(shape: Shape, depth = 0): void {
+  u32(): number {
+    const bytes = this.take(4);
+    return new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+  }
+  scan(schema: Schema.Top): void {
+    this.walk(Schema.toEncoded(schema).ast);
+  }
+  private walk(ast: SchemaAST.AST, depth = 0, omitTag = false): void {
     if (++this.nodes > MAX_NODES || depth > 64) throw new Error("borsh structure limit exceeded");
-    // Metadata is library-owned and the shapes are fixed locally, never supplied by a peer.
-    const o = shape.options as Record<string, any> | null;
-    const nested = (type: string, options: unknown) => this.scan({ type, options }, depth + 1);
-    const sizes: Record<string, number> = { u8: 1, u16: 2, u32: 4, u64: 8, u128: 16 };
-    if (shape.type in sizes) {
-      this.take(sizes[shape.type]!);
-      return;
+    const nested = (child: SchemaAST.AST) => this.walk(child, depth + 1);
+    let layout = ast.annotations?.["@zorsh/effect/borsh/layout"];
+    const checks = [...(ast.checks ?? [])];
+    for (let check = checks.pop(); check !== undefined; check = checks.pop()) {
+      layout ??= check.annotations?.["@zorsh/effect/borsh/layout"];
+      if (check._tag === "FilterGroup") checks.push(...check.checks);
     }
-    switch (shape.type) {
-      case "unit":
-        return;
-      case "bool":
-        this.take(1);
-        return;
-      case "bytes": {
-        const length = o?.length ?? b.u32().deserialize(this.take(4));
-        this.take(length);
+    if (typeof layout === "object" && layout !== null && "kind" in layout) {
+      if (layout.kind === "integer" && "bits" in layout && typeof layout.bits === "number") {
+        this.take(layout.bits / 8);
         return;
       }
-      case "string": {
-        const length = b.u32().deserialize(this.take(4));
+      if (layout.kind === "fixedBytes" && "length" in layout && typeof layout.length === "number") {
+        this.take(layout.length);
+        return;
+      }
+      throw new Error("unsupported preflight layout annotation");
+    }
+    switch (ast._tag) {
+      case "Boolean":
+        if (this.byte() > 1) throw new Error("invalid bool tag");
+        return;
+      case "String": {
+        const length = this.u32();
         if (length > 1_048_576) throw new Error("borsh string exceeds 1 MiB");
         this.take(length);
         return;
       }
-      case "struct":
-        for (const field of Object.values(o!)) nested(field.type, field.options);
-        return;
-      case "vec": {
-        const length = this.count("vector");
-        for (let i = 0; i < length; i++) nested(o!.elementType, o!.elementOptions);
-        return;
-      }
-      case "option": {
-        if (this.byte() === 1) nested(o!.valueType, o!.valueOptions);
-        return;
-      }
-      case "enum": {
-        const tag = this.byte();
-        const variant = o!.variants.find((v: { index: number }) => v.index === tag);
-        if (!variant || variant.name.startsWith("Unsupported")) {
-          throw new Error(
-            `unsupported borsh enum variant ${tag}${variant ? ` (${variant.name})` : ""}`,
-          );
+      case "Objects":
+        for (const field of ast.propertySignatures) {
+          if (omitTag && field.name === "_tag") continue;
+          nested(field.type);
         }
-        nested(variant.type, variant.options);
+        return;
+      case "Arrays": {
+        if (ast.rest.length === 0) {
+          for (const item of ast.elements) nested(item);
+          return;
+        }
+        if (ast.elements.length || ast.rest.length !== 1)
+          throw new Error("unsupported preflight tuple");
+        const count = this.count("vector");
+        for (let i = 0; i < count; i++) nested(ast.rest[0]);
+        return;
+      }
+      case "Declaration": {
+        const representation = ast.annotations?.representation;
+        const id =
+          typeof representation === "object" && representation !== null && "id" in representation
+            ? representation.id
+            : undefined;
+        if (id === "effect/schema/Uint8Array") {
+          this.take(this.u32());
+          return;
+        }
+        if (id === "effect/schema/Option") {
+          const tag = this.byte();
+          if (tag > 1) throw new Error("invalid Option tag");
+          if (tag === 1) nested(ast.typeParameters[0]);
+          return;
+        }
+        throw new Error(`unsupported preflight declaration ${String(id)}`);
+      }
+      case "Union": {
+        const tag = this.byte();
+        const member = ast.types[tag];
+        const label =
+          member?._tag === "Objects"
+            ? member.propertySignatures.find((field) => field.name === "_tag")?.type
+            : undefined;
+        if (
+          label?._tag !== "Literal" ||
+          typeof label.literal !== "string" ||
+          label.literal.startsWith("Unsupported")
+        )
+          throw new Error(`unsupported borsh enum variant ${tag}`);
+        this.walk(member, depth + 1, true);
         return;
       }
       default:
-        throw new Error(`unsupported schema kind ${shape.type}`);
+        throw new Error(`unsupported preflight schema ${ast._tag}`);
     }
   }
-  read<T>(schema: BorshSchema<T>): T {
+  read<A, I>(schema: Schema.Codec<A, I>): A {
     const start = this.offset;
     this.scan(schema);
-    return schema.deserialize(this.bytes.subarray(start, this.offset));
+    return decode(schema, this.bytes.subarray(start, this.offset));
   }
   end(): void {
     if (this.offset !== this.bytes.length)
@@ -485,7 +528,7 @@ export function decodeChunkResponse(bytes: Uint8Array) {
   const cursor = new Cursor(bytes);
   const chunkHash = cursor.read(Hash);
   // We request receipts only. Skip any parts without allocating decoded objects.
-  cursor.scan(b.vec(ChunkPartSchema));
+  cursor.scan(Schema.Array(ChunkPartSchema));
   const count = cursor.count("receipt proofs");
   const receipts = Array.from({ length: count }, () => {
     const start = cursor.offset;
@@ -494,8 +537,8 @@ export function decodeChunkResponse(bytes: Uint8Array) {
     return {
       receipts,
       receiptBytes,
-      fromShardId: cursor.read(b.u64()),
-      toShardId: cursor.read(b.u64()),
+      fromShardId: cursor.read(Borsh.U64),
+      toShardId: cursor.read(Borsh.U64),
       proof: cursor.read(MerklePathSchema),
     };
   });
@@ -525,7 +568,7 @@ export function verifyReceiptProof(
   )
     return false;
   const hash = createHash("sha256")
-    .update(b.u64().serialize(receipt.toShardId))
+    .update(encode(Borsh.U64, receipt.toShardId))
     .update(receipt.receiptBytes)
     .digest();
   return verifyMerklePath(sha256(hash), receipt.proof, root);
@@ -537,7 +580,7 @@ export function verifyMerklePath(
 ): boolean {
   let hash = leafHash;
   for (const item of proof)
-    hash = "Left" in item.direction ? combine(item.hash, hash) : combine(hash, item.hash);
+    hash = item.direction._tag === "Left" ? combine(item.hash, hash) : combine(hash, item.hash);
   return equal(hash, root);
 }
 function readChunkHeader(cursor: Cursor) {
@@ -550,7 +593,7 @@ function readChunkHeader(cursor: Cursor) {
     throw new Error(`unsupported chunk inner version ${innerVersion}; expected V4/V5`);
   const inner = innerVersion === 3 ? cursor.read(ChunkInnerV4) : cursor.read(ChunkInnerV5);
   const innerHash = sha256(cursor.bytes.subarray(start, cursor.offset));
-  const heightIncluded = cursor.read(b.u64());
+  const heightIncluded = cursor.read(Borsh.U64);
   const signature = cursor.read(Signature);
   return {
     ...inner,
@@ -586,9 +629,9 @@ export function decodeBlock(bytes: Uint8Array) {
   const chunks = Array.from({ length: count }, () => readChunkHeader(cursor));
   if (cursor.count("challenges") !== 0)
     throw new Error("nonempty deprecated challenges are unsupported");
-  const vrfValue = cursor.read(b.bytes(32));
-  const vrfProof = cursor.read(b.bytes(64));
-  const chunkEndorsements = cursor.read(b.vec(b.vec(b.option(Signature))));
+  const vrfValue = cursor.read(Borsh.fixedBytes(32));
+  const vrfProof = cursor.read(Borsh.fixedBytes(64));
+  const chunkEndorsements = cursor.read(Schema.Array(Schema.Array(Schema.Option(Signature))));
   cursor.end();
   const bodyHash = sha256(bytes.subarray(bodyStart));
   if (!equal(bodyHash, rest.blockBodyHash)) throw new Error("block body hash mismatch");

@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import bs58 from "bs58";
-import { b } from "@zorsh/zorsh";
-import { Clock, Deferred, Effect, Metric, Stream } from "effect";
+import { Borsh } from "@zorsh/effect";
+import { Arbitrary, Clock, Deferred, Effect, Metric, Option, Schema, Stream } from "effect";
 import { test } from "vite-plus/test";
 import {
   observe,
@@ -15,6 +15,8 @@ import {
 } from "../src/network.ts";
 import { decodeArgs, signRequests, metrics as mpcMetrics, type SignRequest } from "../src/mpc.ts";
 import {
+  encode,
+  decode,
   encodeMessage,
   decodeMessage,
   publicKeyBorsh,
@@ -30,6 +32,7 @@ import {
 import { openPeer, peerMetrics, type Peer, type PeerEvent } from "../src/peer.ts";
 
 import {
+  ActionSchema,
   BlockBodySchema,
   BlockSchema,
   ChunkInnerSchema,
@@ -60,7 +63,11 @@ const targetShardId = 4;
 const sourceShardId = 7n;
 const epochId = bs58.encode(zero);
 const signCall = (args: Uint8Array): Action => ({
-  FunctionCall: { methodName: "sign", args, gas: 30n, deposit: 1n },
+  _tag: "FunctionCall" as const,
+  methodName: "sign",
+  args,
+  gas: 30n,
+  deposit: 1n,
 });
 const signAction = signCall(Buffer.from('{"request":{"payload":[1]}}'));
 const receipt = (receiverId: string, actions: Action[] = [signAction]): Receipt => ({
@@ -68,24 +75,23 @@ const receipt = (receiverId: string, actions: Action[] = [signAction]): Receipt 
   receiverId,
   receiptId: Buffer.alloc(32, receiverId === contractId ? 1 : 2),
   receipt: {
-    ActionV2: {
-      signerId: "caller.testnet",
-      refundTo: null,
-      signerPublicKey: { Ed25519: zero },
-      gasPrice: 1n,
-      outputDataReceivers: [],
-      inputDataIds: [],
-      actions,
-    },
+    _tag: "ActionV2" as const,
+    signerId: "caller.testnet",
+    refundTo: Option.none(),
+    signerPublicKey: { _tag: "Ed25519" as const, value: zero },
+    gasPrice: 1n,
+    outputDataReceivers: [],
+    inputDataIds: [],
+    actions,
   },
 });
 
 // Values use the production layouts; hashes are derived independently below.
 // Frozen testnet captures separately guard against a shared encoder/decoder bug.
 function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
-  const list = ReceiptsSchema.serialize(receipts);
+  const list = encode(ReceiptsSchema, receipts);
   const root = hash(hash(cat(u64(BigInt(targetShardId)), list)));
-  const inner: b.infer<typeof ChunkInnerV4> = {
+  const inner: typeof ChunkInnerV4.Type = {
     prevBlockHash: zero,
     prevStateRoot: zero,
     prevOutcomeRoot: zero,
@@ -100,71 +106,81 @@ function fixture(receipts = [receipt(contractId), receipt("other.testnet")]) {
     txRoot: zero,
     prevValidatorProposals: [],
     congestionInfo: {
-      V1: { delayedReceiptsGas: 0n, bufferedReceiptsGas: 0n, receiptBytes: 0n, allowedShard: 0 },
+      _tag: "V1" as const,
+      delayedReceiptsGas: 0n,
+      bufferedReceiptsGas: 0n,
+      receiptBytes: 0n,
+      allowedShard: 0,
     },
-    bandwidthRequests: { V1: { requests: [] } },
+    bandwidthRequests: { _tag: "V1" as const, requests: [] },
   };
-  const chunkHash = hash(cat(hash(ChunkInnerSchema.serialize({ V4: inner })), zero));
-  const signature = { Ed25519: Buffer.alloc(64) };
-  const body: b.infer<typeof BlockBodySchema> = {
-    V2: {
-      chunks: [{ V3: { inner: { V4: inner }, heightIncluded: 42n, signature } }],
-      challenges: [],
-      vrfValue: zero,
-      vrfProof: Buffer.alloc(64),
-      chunkEndorsements: [[]],
-    },
-  };
-  const blockBytes = BlockSchema.serialize({
-    V4: {
-      header: {
-        V5: {
-          prevHash: zero,
-          innerLite: {
-            height: 42n,
-            epochId: zero,
-            nextEpochId: zero,
-            prevStateRoot: zero,
-            prevOutcomeRoot: zero,
-            timestamp: 1000n,
-            nextBpHash: zero,
-            blockMerkleRoot: zero,
-          },
-          innerRest: {
-            blockBodyHash: hash(BlockBodySchema.serialize(body)),
-            prevChunkOutgoingReceiptsRoot: zero,
-            chunkHeadersRoot: zero,
-            chunkTxRoot: zero,
-            challengesRoot: zero,
-            randomValue: zero,
-            prevValidatorProposals: [],
-            chunkMask: [true],
-            nextGasPrice: 1n,
-            totalSupply: 2n,
-            challengesResult: [],
-            lastFinalBlock: zero,
-            lastDsFinalBlock: zero,
-            blockOrdinal: 42n,
-            prevHeight: 41n,
-            epochSyncDataHash: null,
-            approvals: [],
-            latestProtocolVersion: 87,
-            chunkEndorsements: [Buffer.alloc(0)],
-          },
-          signature,
-        },
+  const chunkHash = hash(
+    cat(hash(encode(ChunkInnerSchema, { _tag: "V4" as const, ...inner })), zero),
+  );
+  const signature = { _tag: "Ed25519" as const, value: Buffer.alloc(64) };
+  const body: typeof BlockBodySchema.Type = {
+    _tag: "V2" as const,
+    chunks: [
+      {
+        _tag: "V3" as const,
+        inner: { _tag: "V4" as const, ...inner },
+        heightIncluded: 42n,
+        signature,
       },
-      body,
+    ],
+    challenges: [],
+    vrfValue: zero,
+    vrfProof: Buffer.alloc(64),
+    chunkEndorsements: [[]],
+  };
+  const blockBytes = encode(BlockSchema, {
+    _tag: "V4" as const,
+    header: {
+      _tag: "V5" as const,
+      prevHash: zero,
+      innerLite: {
+        height: 42n,
+        epochId: zero,
+        nextEpochId: zero,
+        prevStateRoot: zero,
+        prevOutcomeRoot: zero,
+        timestamp: 1000n,
+        nextBpHash: zero,
+        blockMerkleRoot: zero,
+      },
+      innerRest: {
+        blockBodyHash: hash(encode(BlockBodySchema, body)),
+        prevChunkOutgoingReceiptsRoot: zero,
+        chunkHeadersRoot: zero,
+        chunkTxRoot: zero,
+        challengesRoot: zero,
+        randomValue: zero,
+        prevValidatorProposals: [],
+        chunkMask: [true],
+        nextGasPrice: 1n,
+        totalSupply: 2n,
+        challengesResult: [],
+        lastFinalBlock: zero,
+        lastDsFinalBlock: zero,
+        blockOrdinal: 42n,
+        prevHeight: 41n,
+        epochSyncDataHash: Option.none(),
+        approvals: [],
+        latestProtocolVersion: 87,
+        chunkEndorsements: [Buffer.alloc(0)],
+      },
+      signature,
     },
+    body,
   });
-  const responseBytes = ChunkResponseSchema.serialize({
+  const responseBytes = encode(ChunkResponseSchema, {
     chunkHash,
     parts: [],
     receipts: [
       { receipts, fromShardId: sourceShardId, toShardId: BigInt(targetShardId), proof: [] },
     ],
   });
-  const emptyResponse = ChunkResponseSchema.serialize({ chunkHash, parts: [], receipts: [] });
+  const emptyResponse = encode(ChunkResponseSchema, { chunkHash, parts: [], receipts: [] });
   const block: PeerEvent = {
     receivedAt: { unixMs: 1000, monotonicNs: 0n },
     type: "message",
@@ -240,7 +256,7 @@ const collect = (events: PeerEvent[], expectedEpoch = epochId) =>
 
 test("proofs preserve multiple sign actions, suppress repeated responses, and record monotonic metrics", async () => {
   const f = fixture([
-    receipt(contractId, [signAction, { Transfer: { deposit: 1n } }, signAction]),
+    receipt(contractId, [signAction, { _tag: "Transfer" as const, deposit: 1n }, signAction]),
     receipt("other.testnet"),
   ]);
   const result = await Effect.runPromise(
@@ -324,8 +340,11 @@ test("network observations work for other accounts and leave action interpretati
   );
   assert.equal(observations.length, 1);
   assert.deepEqual(
-    ReceiptsSchema.serialize(observations.map((item) => item.receipt)),
-    ReceiptsSchema.serialize([raw]),
+    encode(
+      ReceiptsSchema,
+      observations.map((item) => item.receipt),
+    ),
+    encode(ReceiptsSchema, [raw]),
   );
   assert.equal(observations[0]?.blockHeight, "42");
   assert.deepEqual(
@@ -338,7 +357,11 @@ test("network observations work for other accounts and leave action interpretati
 
 test("MPC deduplicates individual actions across peers, with fresh state per subscription", async () => {
   const item: ReceiptObservation = {
-    receipt: receipt(contractId, [signAction, { Transfer: { deposit: 1n } }, signAction]),
+    receipt: receipt(contractId, [
+      signAction,
+      { _tag: "Transfer" as const, deposit: 1n },
+      signAction,
+    ]),
     blockHeight: "42",
     peer: "first",
     observedAt: "2026-10-21T00:00:00.000Z",
@@ -369,13 +392,34 @@ test("network options fail before RPC for invalid accounts, peer counts and inse
   }
 });
 
-test("published Zorsh validates tags and UTF-8; the wire cursor adds resource and EOF limits", () => {
-  assert.throws(() => b.bool().deserialize(u8(2)), /bool/);
-  assert.throws(() => b.option(b.u8()).deserialize(u8(2)), /Option/);
-  assert.throws(() => b.string().deserialize(bytes(u8(0xff))), /encoded data/);
-  assert.equal(b.u8().deserialize(cat(u8(7), u8(99))), 7);
-  // Four bytes can request many zero-sized values despite a tiny input buffer.
-  assert.equal(b.vec(b.unit()).deserialize(u32(16_385)).length, 16_385);
+test("native Effect schemas generate typed function-call fixtures with the NEAR action discriminant", async () => {
+  const actions = await Effect.runPromise(
+    Arbitrary.sampleEffect(
+      Arbitrary.schema(
+        ActionSchema.cases.FunctionCall.mapFields((fields) => ({
+          ...fields,
+          methodName: Schema.Literal("sign"),
+        })),
+      ),
+      {
+        count: 25,
+        seed: 42,
+      },
+    ),
+  );
+  for (const action of actions) {
+    const bytes = encode(ActionSchema, action);
+    assert.equal(bytes[0], 2);
+    assert.ok(Schema.toEquivalence(ActionSchema)(decode(ActionSchema, bytes), action));
+  }
+});
+
+test("Effect Borsh validates tags, UTF-8 and EOF; preflight retains application resource limits", () => {
+  assert.throws(() => decode(Schema.Boolean, u8(2)), /Boolean|bool/i);
+  assert.throws(() => decode(Schema.Option(Borsh.U8), u8(2)), /Option/);
+  assert.throws(() => decode(Schema.String, bytes(u8(0xff))), /UTF-8/);
+  assert.throws(() => decode(Borsh.U8, cat(u8(7), u8(99))), /Trailing/);
+  assert.throws(() => decode(Schema.Array(Borsh.Unit), u32(16_385)), /zero-sized/);
   assert.throws(() => decodeChunkResponse(Buffer.alloc(16 * 1024 * 1024 + 1)), /16 MiB/);
   assert.throws(() => decodeChunkResponse(cat(zero, u32(16_385))), /count/);
   assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(16_385))), /count/);
@@ -405,12 +449,9 @@ test("captured testnet data retains its MPC request, verifies its commitment, an
     hash(proofBytes).toString("hex"),
     "389665c2073f9ea83e04f5b4a06f6149fe7cbd71cbf6fecb4b24cad472c177d9",
   );
+  assert.deepEqual(Buffer.from(encode(BlockSchema, decode(BlockSchema, blockBytes))), blockBytes);
   assert.deepEqual(
-    Buffer.from(BlockSchema.serialize(BlockSchema.deserialize(blockBytes))),
-    blockBytes,
-  );
-  assert.deepEqual(
-    Buffer.from(ChunkResponseSchema.serialize(ChunkResponseSchema.deserialize(proofBytes))),
+    Buffer.from(encode(ChunkResponseSchema, decode(ChunkResponseSchema, proofBytes))),
     proofBytes,
   );
   const block = decodeBlock(blockBytes),

@@ -56,16 +56,15 @@ export const signRequests = <E, R>(
       }: ReceiptObservation) {
         if (receipt.receiverId !== contractId) return [];
         const body = receipt.receipt;
-        const actions =
-          "Action" in body ? body.Action.actions : "ActionV2" in body ? body.ActionV2.actions : [];
+        const actions = body._tag === "Action" || body._tag === "ActionV2" ? body.actions : [];
         const requests: SignRequest[] = [];
         for (const [actionIndex, action] of actions.entries()) {
-          if (!("FunctionCall" in action) || action.FunctionCall.methodName !== "sign") continue;
+          if (action._tag !== "FunctionCall" || action.methodName !== "sign") continue;
           const receiptId = bs58.encode(receipt.receiptId);
           const key = `${receiptId}:${actionIndex}`;
           if (yield* Cache.has(seen, key)) continue;
           yield* Cache.set(seen, key, true);
-          const decoded = yield* decodeArgs(action.FunctionCall.args).pipe(
+          const decoded = yield* decodeArgs(action.args).pipe(
             Effect.map(Option.some),
             Effect.catch((cause) =>
               Effect.gen(function* () {
