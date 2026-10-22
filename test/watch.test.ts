@@ -432,7 +432,7 @@ test("native Effect schemas generate typed function-call fixtures with the NEAR 
 test("native Effect schemas generate fixed-width hashes and signature arrays", async () => {
   const schema = Schema.Struct({
     receiptId: Hash,
-    signatures: Schema.Array(Signature).pipe(Borsh.fixedArray(3)),
+    signatures: Borsh.fixedArray(Signature, 3),
   });
   const fixtures = await Effect.runPromise(
     Arbitrary.sampleEffect(Arbitrary.schema(schema), { count: 25, seed: 42 }),
@@ -452,14 +452,17 @@ test("Effect Borsh schemas enforce tags, UTF-8, EOF and allocation limits", () =
   assert.throws(() => decode(Borsh.U8, cat(u8(7), u8(99))), /Trailing/);
   assert.throws(() => decode(Schema.Array(Borsh.Unit), u32(16_385)), /zero-sized/);
   assert.throws(() => decodeChunkResponse(Buffer.alloc(16 * 1024 * 1024 + 1)), /maxBytes/);
-  assert.throws(() => decodeChunkResponse(cat(zero, u32(16_385))), /length of at most 0/);
+  assert.throws(
+    () => decodeChunkResponse(cat(zero, u32(16_385))),
+    /Length 16385 exceeds maxLength \(0\)/,
+  );
   assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(16_385))), /maxItems/);
   assert.throws(
     () => decodeChunkResponse(cat(zero, u32(0), u32(1), u32(1), u32(1_048_577), Buffer.alloc(128))),
-    /1 MiB/,
+    /Length 1048577 exceeds maxLength \(1048576\)/,
   );
   // Receipts-only requests never ask for chunk parts. Reject even their count prefix.
-  assert.throws(() => decodeChunkResponse(cat(zero, u32(1))), /length of at most 0/);
+  assert.throws(() => decodeChunkResponse(cat(zero, u32(1))), /Length 1 exceeds maxLength \(0\)/);
   assert.throws(() => decodeChunkResponse(cat(zero, u32(0), u32(0), u8(0))), /Trailing/);
   const f = fixture();
   assert.ok(f.block.type === "message" && f.block.message.type === "block_response");
@@ -473,15 +476,28 @@ test("string schemas bound UTF-8 bytes before decoding and preserve Borsh text e
     assert.deepEqual(encoded, encode(Schema.String, value));
     assert.equal(decode(WireString, encoded), value);
   }
-  assert.throws(() => decode(WireString, u32(1_048_577)), /1 MiB/);
+  assert.throws(
+    () => decode(WireString, u32(1_048_577)),
+    /Length 1048577 exceeds maxLength \(1048576\)/,
+  );
   assert.throws(() => decode(WireString, bytes(u8(0xff))), /UTF-8/);
-  assert.throws(() => encode(WireString, "\uD800"), /well-formed Unicode/);
+  assert.throws(() => encode(WireString, "\uD800"), /Lone UTF-16 surrogate/);
   assert.throws(() => encode(WireString, "é".repeat(524_289)), /1 MiB/);
+  assert.equal(Schema.is(WireString)("\uD800"), false);
+  const oneByte = Borsh.toCodec(Schema.String.check(Borsh.maxLength(1)), wireLimits);
+  assert.throws(
+    () => Schema.encodeSync(oneByte)("é", { disableChecks: true }),
+    /Length 2 exceeds maxLength \(1\) at byte 0/,
+  );
+  assert.throws(
+    () => Schema.decodeSync(oneByte)(u32(2), { disableChecks: true }),
+    /Length 2 exceeds maxLength \(1\) at byte 0/,
+  );
 });
 
-test("native collection limits reject prefixes early and share a budget across nested vectors", () => {
-  const oneItem = Schema.Array(Borsh.U32).check(Schema.isMaxLength(1));
-  assert.throws(() => decode(oneItem, u32(4)), /got 4 items/);
+test("explicit wire limits reject prefixes early and share a budget across nested vectors", () => {
+  const oneItem = Schema.Array(Borsh.U32).check(Borsh.maxLength(1));
+  assert.throws(() => decode(oneItem, u32(4)), /Length 4 exceeds maxLength \(1\)/);
   const nested = Schema.Array(Schema.Array(Borsh.U8));
   const codec = Borsh.toCodec(nested, { ...wireLimits, maxItems: 3 });
   // Two outer entries plus one inner entry exhaust the budget before the second payload.

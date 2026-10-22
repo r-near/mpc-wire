@@ -1,29 +1,10 @@
 /** NEAR wire and RPC schemas. No transport, cryptography or MPC dependencies. */
 import { Borsh } from "@zorsh/effect";
-import { Effect, Schema, SchemaIssue, SchemaTransformation } from "effect";
+import { Schema } from "effect";
 
 export const wireLimits = { maxBytes: 16 * 1024 * 1024, maxItems: 16_384 };
-const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-const encoder = new TextEncoder();
-// A Borsh string is a byte vector. Bound its encoded bytes before UTF-8 decoding.
-export const WireString = Borsh.Bytes.check(
-  Schema.isMaxLength(1_048_576, { expected: "string at most 1 MiB" }),
-).pipe(
-  Schema.decodeTo(
-    Schema.String.check(
-      Schema.makeFilter((value) => value.isWellFormed(), {
-        expected: "well-formed Unicode",
-      }),
-    ),
-    SchemaTransformation.transformEffect({
-      decode: (bytes) =>
-        Effect.try({
-          try: () => utf8.decode(bytes),
-          catch: () => new SchemaIssue.InvalidValue({ message: "invalid UTF-8" }),
-        }),
-      encode: (value) => Effect.succeed(encoder.encode(value)),
-    }),
-  ),
+export const WireString = Schema.String.check(
+  Borsh.maxLength(1_048_576, { expected: "a string of at most 1 MiB" }),
 );
 
 export const TESTNET_GENESIS = "FWJ9kR6KFWoyMoNjpLXXGHeuiy7tEY6GmoFeCA5yuc6b";
@@ -386,7 +367,7 @@ export const ReceiptProofSchema = Schema.Struct({
 export const ChunkResponseSchema = Schema.Struct({
   chunkHash: Hash,
   // Our requests contain no part ordinals; reject unsolicited parts before decoding.
-  parts: Schema.Array(ChunkPartSchema).check(Schema.isMaxLength(0)),
+  parts: Schema.Array(ChunkPartSchema).check(Borsh.maxLength(0)),
   receipts: Schema.Array(ReceiptProofSchema),
 });
 
@@ -407,7 +388,7 @@ export const BlockBodySchema = Schema.TaggedUnion({
   V2: {
     chunks: Schema.Array(ChunkHeaderSchema),
     // Deprecated challenges must be empty.
-    challenges: Schema.Array(Borsh.U8).check(Schema.isMaxLength(0)),
+    challenges: Schema.Array(Borsh.U8).check(Borsh.maxLength(0)),
     vrfValue: Borsh.fixedBytes(32),
     vrfProof: Borsh.fixedBytes(64),
     chunkEndorsements: Schema.Array(Schema.Array(Schema.Option(Signature))),

@@ -8,7 +8,7 @@
     "watch": "node src/watch.ts"
   },
   "dependencies": {
-    "@zorsh/effect": "file:vendor/zorsh-effect-541e03f.tgz",
+    "@zorsh/effect": "file:vendor/zorsh-effect-d2c6494.tgz",
     "bs58": "6.0.0",
     "effect": "4.0.5",
     "near-kit": "0.20.2",
