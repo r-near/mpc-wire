@@ -2,7 +2,7 @@
 
 A read-only watcher for `sign` calls to NEAR's `v1.signer-prod.testnet` MPC contract. Connects to up to 12 peers and prints the request arguments without running a NEAR node.
 
-This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `d2c6494`](https://github.com/r-near/zorsh/tree/d2c649405d79a6a0c9e3fe73ca8b68afb0d0bef0/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
+This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `c8be68c`](https://github.com/r-near/zorsh/tree/c8be68c8f0fb2b3ef24a19029705bd0cb66e47ac/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
 
 ## Run
 
@@ -25,41 +25,41 @@ Request lines are JSON, including receipt ID, action index, caller, arguments, b
 
 ## Sample run
 
-Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and Zorsh main at `d2c6494`. All 12 peers became active. The run observed three distinct sign requests and checked 2,309 receipt proofs; five candidates failed connection or handshake checks. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
+Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and Zorsh main at `c8be68c`. All 12 peers became active. The run observed four distinct sign requests and checked 3,266 receipt proofs. Seven candidates failed connection or handshake checks, and one was rejected for an epoch mismatch. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
 
 ```text
 connecting to up to 12 testnet peers; watching v1.signer-prod.testnet
 {
   "event": "sign-request",
-  "receiptId": "9yFdVoGK4pVwYiD9LSFkxECdzqA7GMR8pG8ayZpUgeMp",
+  "receiptId": "GKLTBxnWr6utToTriDxqVGcYfDNLTsTRunwCfC8LJAFF",
   "actionIndex": 0,
   "caller": "tx-bench.testnet",
   "args": {
     "request": {
-      "domain_id": 1,
+      "domain_id": 0,
       "path": "",
       "payload_v2": {
-        "Eddsa": "92088bdfcafe7c41071a1e99616dcc22a77c3b2c23f4d9be1f8b3635b36f7115"
+        "Ecdsa": "1f626618b7d5b8e732959c553d3eebc0ff5176fb55ed26498a37bf72dda1299f"
       }
     }
   },
-  "blockHeight": "274284240",
-  "peer": "34.34.24.155",
-  "observedAt": "2026-10-22T18:19:26.934Z",
-  "blockToRequestMs": 178.877584
+  "blockHeight": "274294853",
+  "peer": "142.132.203.80",
+  "observedAt": "2026-10-22T20:00:05.280Z",
+  "blockToRequestMs": 184.361958
 }
 {
   "event": "metrics",
-  "at": "2026-10-22T18:20:02.889Z",
+  "at": "2026-10-22T20:00:41.238Z",
   "metrics": [
     {"name":"fresh_peers","type":"Gauge","value":12},
-    {"name":"peer_failures","type":"Counter","count":5},
-    {"name":"receipt_proofs","type":"Counter","count":2309},
-    {"name":"receipt_fetch_ms","type":"Histogram","count":2309,"min":19.3625,"max":914.695125,"sum":426903.13083199994},
-    {"name":"response_processing_ms","type":"Histogram","count":2309,"min":0.098084,"max":7.081625,"sum":2518.8185869999984},
-    {"name":"missing_proofs","type":"Counter","count":5151},
-    {"name":"sign_requests","type":"Counter","count":3},
-    {"name":"block_to_request_ms","type":"Histogram","count":3,"min":172.767542,"max":196.86,"sum":548.505126}
+    {"name":"peer_failures","type":"Counter","count":8},
+    {"name":"receipt_proofs","type":"Counter","count":3266},
+    {"name":"receipt_fetch_ms","type":"Histogram","count":3266,"min":44.011584,"max":2559.101917,"sum":739315.9621669969},
+    {"name":"response_processing_ms","type":"Histogram","count":3266,"min":0.092208,"max":8.535333,"sum":3897.6738010000026},
+    {"name":"missing_proofs","type":"Counter","count":5235},
+    {"name":"sign_requests","type":"Counter","count":4},
+    {"name":"block_to_request_ms","type":"Histogram","count":4,"min":182.83375,"max":186.128,"sum":736.5379579999999}
   ]
 }
 ```
@@ -115,6 +115,6 @@ Synthetic fixtures use the same native Effect schemas as the decoder. Seeded `Ar
 
 Uses Effect 4 and near-kit for bootstrap. `protobufjs` reads the pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) schema in `vendor/`. Zorsh decodes the Borsh schemas with `maxBytes` and `maxItems`; explicit `Borsh.maxLength` checks reject oversized strings and unwanted vectors at their length prefixes. Ordinary Effect length checks run after decoding. `withBytes` retains the received receipt, header and body bytes for proof hashes, while prefix decoding separates routing headers from their bodies. There is no custom Borsh cursor or schema walker.
 
-The trial tarball was built from unmodified commit `d2c649405d79a6a0c9e3fe73ca8b68afb0d0bef0` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `53f662b012b1a4100cf1a5cb791df3a1338691e851547290d6156f4c2478de61`.
+The trial tarball was built from unmodified commit `c8be68c8f0fb2b3ef24a19029705bd0cb66e47ac` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `74b0388eab2ce1149aa9fbec815c92670f316cd14f620800976b3d904afffd9e`.
 
 `WireString` is `Schema.String.check(Borsh.maxLength(1_048_576))`. Zorsh checks its byte limit before UTF-8 decoding, preserves leading BOMs and rejects lone UTF-16 surrogates on encode. The layouts are fixed and nonrecursive. Tests build captured fields from typed values and their schema encoding, so `withBytes` also checks that those values and bytes agree.
