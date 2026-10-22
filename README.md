@@ -2,7 +2,7 @@
 
 A read-only watcher for `sign` calls to NEAR's `v1.signer-prod.testnet` MPC contract. Connects to up to 12 peers and prints the request arguments without running a NEAR node.
 
-This branch trials the unreleased `@zorsh/effect` package from [Zorsh main at `ec3938f`](https://github.com/r-near/zorsh/tree/ec3938feb4eaa16f009026d4a8b1cf6626ee56f0/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
+This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `4a54b28`](https://github.com/r-near/zorsh/tree/4a54b28775b58f380d72f4426a471f2b23c37f3b/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
 
 ## Run
 
@@ -25,7 +25,7 @@ Request lines are JSON, including receipt ID, action index, caller, arguments, b
 
 ## Sample run
 
-Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and the Zorsh Effect trial build. All 12 peers became active. The run observed two distinct sign requests and checked 3,093 receipt proofs; eleven candidates failed connection, handshake or epoch checks. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
+Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and the earlier Zorsh Effect build at `ec3938f`. All 12 peers became active. The run observed two distinct sign requests and checked 3,093 receipt proofs; eleven candidates failed connection, handshake or epoch checks. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
 
 ```text
 connecting to up to 12 testnet peers; watching v1.signer-prod.testnet
@@ -109,10 +109,10 @@ await Effect.runPromise(
 
 Each observation includes the raw decoded receipt, block height, source peer and local timing. Peers may report the same receipt. The MPC consumer deduplicates by receipt ID and action index for up to ten minutes, retaining at most 4,096 entries per subscription. The network layer does not interpret function arguments.
 
-Synthetic fixtures use the same native Effect schemas as the decoder. A seeded `Arbitrary.schema` test also generates sign actions and round-trips their wire encoding. Their builders compute the dependent receipt, chunk and block hashes. The two captured files in `fixtures/` stay fixed: their hashes and exact round trips catch compatibility mistakes that a generated fixture could share with the decoder. Add captures when supporting new wire versions; do not regenerate the historical ones.
+Synthetic fixtures use the same native Effect schemas as the decoder. Seeded `Arbitrary.schema` tests generate sign actions, hashes and fixed-length signature arrays, then round-trip their wire encoding. The fixture builders compute the dependent receipt, chunk and block hashes. The two captured files in `fixtures/` stay fixed: their hashes and exact round trips catch compatibility mistakes that a generated fixture could share with the decoder. Add captures when supporting new wire versions; do not regenerate the historical ones.
 
 Uses Effect 4 and near-kit for bootstrap. `protobufjs` reads the pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) schema in `vendor/`. Zorsh's Effect codecs validate Borsh tags, UTF-8 and exact input consumption. The cursor still limits item counts, string bytes and structural complexity before allocation, and locates the original byte spans needed by proof checks. It reads layout annotations from the pinned package; use the bounded protocol decoders for network input.
 
-The trial tarball was built from unmodified commit `ec3938feb4eaa16f009026d4a8b1cf6626ee56f0` with `vp install --frozen-lockfile`, `vp -C packages/effect pack` and `vp -C packages/effect pm pack`. It includes the upstream MIT license. Its SHA-256 is `e7c4eb9a49f11c3883e4b8c7dd997d2b3d5fa255a1386494e9271345f2eba271`.
+The trial tarball was built from unmodified commit `4a54b28775b58f380d72f4426a471f2b23c37f3b` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `f4e22e3a9d0ef526132661d833cbb7ab375301374eb6bba5db2100d143bcdeeb`.
 
-A few limits matter when generating fixtures: `fixedBytes(32)` needs native minimum/maximum length checks for reliable arbitrary generation, and `fixedArray(3)` alone does not constrain generated array lengths. Native strings can include lone UTF-16 surrogates that Borsh correctly rejects; the sign-action generator narrows the method to `"sign"`. These findings have been sent to the Zorsh package owner.
+The fixture-generation fixes are included: `fixedBytes` and untransformed `fixedArray` now generate values of the required length. Native strings can still include lone UTF-16 surrogates that Borsh correctly rejects; the sign-action generator narrows the method to `"sign"`. The public decoder still lacks byte-span capture and item/work limits before allocation, so these fixes do not replace the cursor.

@@ -38,7 +38,9 @@ import {
   ChunkInnerSchema,
   ChunkInnerV4,
   ChunkResponseSchema,
+  Hash,
   ReceiptsSchema,
+  Signature,
   type Action,
   type Receipt,
 } from "../src/schemas.ts";
@@ -411,6 +413,22 @@ test("native Effect schemas generate typed function-call fixtures with the NEAR 
     const bytes = encode(ActionSchema, action);
     assert.equal(bytes[0], 2);
     assert.ok(Schema.toEquivalence(ActionSchema)(decode(ActionSchema, bytes), action));
+  }
+});
+
+test("native Effect schemas generate fixed-width hashes and signature arrays", async () => {
+  const schema = Schema.Struct({
+    receiptId: Hash,
+    signatures: Schema.Array(Signature).pipe(Borsh.fixedArray(3)),
+  });
+  const fixtures = await Effect.runPromise(
+    Arbitrary.sampleEffect(Arbitrary.schema(schema), { count: 25, seed: 42 }),
+  );
+  const equivalent = Schema.toEquivalence(schema);
+  for (const fixture of fixtures) {
+    assert.equal(fixture.receiptId.length, 32);
+    assert.equal(fixture.signatures.length, 3);
+    assert.ok(equivalent(decode(schema, encode(schema, fixture)), fixture));
   }
 });
 
