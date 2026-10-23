@@ -1,97 +1,117 @@
 # mpc-wire
 
-A read-only watcher for `sign` calls to NEAR's `v1.signer-prod.testnet` MPC contract. Connects to up to 12 peers and prints the request arguments without running a NEAR node.
+Watch live `sign` calls to NEAR's `v1.signer-prod.testnet` MPC contract. Connect to up to 12 peers and print the request arguments, without running a NEAR node or submitting transactions.
 
-This branch uses the unreleased `@zorsh/effect` package from [Zorsh main at `c8be68c`](https://github.com/r-near/zorsh/tree/c8be68c8f0fb2b3ef24a19029705bd0cb66e47ac/packages/effect). Its built npm tarball is pinned in `vendor/`, so `vp install` works without a separate Zorsh checkout. The package still reports version `0.0.0`; this is not the published 0.1.0 release.
+**This is a read-only experiment, not a source of signing authorization.** It checks receipt proofs against blocks supplied by peers, but does not validate NEAR consensus or receipt execution. A malicious peer can supply a self-consistent fake block and request that pass those checks.
 
 ## Run
 
-Install [Vite+](https://viteplus.dev/guide), then:
+Use Node.js 24.11+ on the 24.x line, or 26+, and install [Vite+](https://viteplus.dev/guide). From this directory:
 
 ```sh
-vp install
+vp install --frozen-lockfile
 vp run watch
 ```
 
-No account, key, or testnet funds needed. By default it runs for 60 seconds, including setup.
+No NEAR account, wallet key, or testnet funds are needed. The watcher uses outbound TCP connections and stops after 60 seconds by default.
 
 ```sh
 PEERS=4 DURATION_SECONDS=300 vp run watch
 ```
 
-Request lines are JSON, including receipt ID, action index, caller, arguments, block height, peer, and observation time. Effect metrics go to stderr every 10 seconds and at shutdown: fresh peers, traffic, verified and missing proofs, failures, request count, and timing histograms.
+| Variable           | Default                         | Meaning                                                    |
+| ------------------ | ------------------------------- | ---------------------------------------------------------- |
+| `PEERS`            | `12`                            | Target connections, from 1 to 12                           |
+| `DURATION_SECONDS` | `60`                            | Total runtime including setup, from 1 to 3,600 seconds     |
+| `RPC_URL`          | `https://test.rpc.fastnear.com` | Testnet bootstrap endpoint; credential-free HTTPS required |
 
-`receipt_fetch_ms` measures request-to-response time. `response_processing_ms` includes local queuing, decoding, and proof verification. `block_to_request_ms` runs from block arrival through receipt verification, before the consumer processes the arguments. `observedAt` is the local wall-clock time when verification finishes. These are local monotonic durations; they do not measure submission latency or compare clocks with another node.
+RPC supplies the initial testnet identity, shard layout, block and peer addresses. After setup, incoming P2P blocks trigger receipt-proof requests; there is no RPC polling. The watcher authenticates its peer connections with a temporary in-memory identity.
+
+## Output
+
+Sign requests go to stdout as JSON. Each includes the receipt ID, action index, caller, arguments, block height, source peer and observation time. The caller is the receipt's predecessor account; it is not necessarily the transaction signer. Arguments are parsed as JSON without assuming a particular version of the MPC contract's request format.
+
+Effect metrics go to stderr every 10 seconds and at shutdown. They include fresh peers, traffic, checked and missing proofs, failures, request count and timing histograms:
+
+| Metric                   | Measures                                                                    |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `receipt_fetch_ms`       | Receipt-proof request to response arrival                                   |
+| `response_processing_ms` | Local queuing, decoding and proof checking                                  |
+| `block_to_request_ms`    | Block arrival to receipt verification, before the consumer parses arguments |
+
+These durations use the local monotonic clock. They do not measure transaction submission latency. `observedAt` is the local wall-clock time when receipt verification finishes. Proof counts include repeated observations across peers; sign requests are deduplicated by receipt ID and action index for up to ten minutes, with a 4,096-entry limit per subscription.
 
 ## Sample run
 
-Captured on October 22, 2026 UTC with `PEERS=12 DURATION_SECONDS=45 vp run watch` and Zorsh main at `c8be68c`. All 12 peers became active. The run observed four distinct sign requests and checked 3,266 receipt proofs. Seven candidates failed connection or handshake checks, and one was rejected for an epoch mismatch. This excerpt shows the first request and final selected metrics. Histogram buckets and counter flags are omitted.
+Captured on October 23, 2026 UTC with the published `@zorsh/effect` 0.1.0 and `PEERS=12 DURATION_SECONDS=45 vp run watch`. All 12 peers became active. The watcher observed four distinct sign requests, checked 4,452 receipt proofs, counted 4,683 responses without a requested proof, and recorded one peer failure.
+
+This excerpt contains the first request and selected final metrics. Identifiers, the derivation path and payload are redacted; timestamps, timings and counts are unchanged. Histogram buckets and counter flags are omitted.
 
 ```text
 connecting to up to 12 testnet peers; watching v1.signer-prod.testnet
 {
   "event": "sign-request",
-  "receiptId": "GKLTBxnWr6utToTriDxqVGcYfDNLTsTRunwCfC8LJAFF",
+  "receiptId": "<redacted>",
   "actionIndex": 0,
-  "caller": "tx-bench.testnet",
+  "caller": "<redacted>",
   "args": {
     "request": {
-      "domain_id": 0,
-      "path": "",
+      "path": "<redacted>",
       "payload_v2": {
-        "Ecdsa": "1f626618b7d5b8e732959c553d3eebc0ff5176fb55ed26498a37bf72dda1299f"
-      }
+        "Eddsa": "<redacted>"
+      },
+      "domain_id": 1
     }
   },
-  "blockHeight": "274294853",
-  "peer": "142.132.203.80",
-  "observedAt": "2026-10-22T20:00:05.280Z",
-  "blockToRequestMs": 184.361958
+  "blockHeight": "274325556",
+  "peer": "<redacted>",
+  "observedAt": "2026-10-23T00:50:20.403Z",
+  "blockToRequestMs": 186.530042
 }
 {
   "event": "metrics",
-  "at": "2026-10-22T20:00:41.238Z",
+  "at": "2026-10-23T00:51:01.038Z",
   "metrics": [
     {"name":"fresh_peers","type":"Gauge","value":12},
-    {"name":"peer_failures","type":"Counter","count":8},
-    {"name":"receipt_proofs","type":"Counter","count":3266},
-    {"name":"receipt_fetch_ms","type":"Histogram","count":3266,"min":44.011584,"max":2559.101917,"sum":739315.9621669969},
-    {"name":"response_processing_ms","type":"Histogram","count":3266,"min":0.092208,"max":8.535333,"sum":3897.6738010000026},
-    {"name":"missing_proofs","type":"Counter","count":5235},
+    {"name":"peer_failures","type":"Counter","count":1},
+    {"name":"receipt_proofs","type":"Counter","count":4452},
+    {"name":"receipt_fetch_ms","type":"Histogram","count":4452,"min":28.292875,"max":2834.040958,"sum":1177030.314410002},
+    {"name":"response_processing_ms","type":"Histogram","count":4452,"min":0.082167,"max":3.531459,"sum":1725.1901970000006},
+    {"name":"missing_proofs","type":"Counter","count":4683},
     {"name":"sign_requests","type":"Counter","count":4},
-    {"name":"block_to_request_ms","type":"Histogram","count":4,"min":182.83375,"max":186.128,"sum":736.5379579999999}
+    {"name":"block_to_request_ms","type":"Histogram","count":4,"min":73.2915,"max":186.530042,"sum":527.9110830000001}
   ]
 }
 ```
 
-## What it sees
+## Limits
 
-Read-only RPC supplies the initial testnet identity, shard layout, and peer addresses. Set `RPC_URL` to change the bootstrap endpoint. After setup, incoming P2P blocks trigger receipt-proof requests; there is no RPC polling.
-
-Receipt membership is checked against the received block's commitments. This client does not validate consensus or execute the contract. A request can still fail execution. It does not obtain continuation IDs or completed signatures.
-
-This is a bounded experiment: no backfill, reconnect loop, or completeness guarantee. Missing proofs and dropped peers remain visible in the metrics. An epoch change stops that peer's observer; restart to refresh the shard layout. Twelve connections can include peers operated by the same provider. Slow consumers apply backpressure; a peer disconnects if its bounded incoming queue fills. Invalid sign arguments are skipped with a warning and an `invalid_sign_requests` counter, without disconnecting the peer.
-
-Each Borsh message is limited to 16 MiB and 16,384 collection items in total, including nested collections. Strings are limited to 1 MiB of UTF-8 bytes. These are watcher limits, not NEAR protocol limits. Receipt-only requests reject responses containing unsolicited chunk parts.
+- Receipt membership is checked against the received block's commitments, using the original wire bytes. Neither the block's canonical status nor the claimed caller is independently established. More peers do not turn these checks into consensus verification.
+- A call may fail execution. The watcher does not obtain execution outcomes, continuation IDs or completed MPC signatures, and cannot replace the MPC node's validating indexer.
+- There is no backfill, reconnect loop or completeness guarantee. An epoch change stops that peer's observer; restart to refresh the shard layout. Twelve connections can include peers run by the same operator.
+- Slow consumers apply backpressure. A peer disconnects if its bounded incoming queue fills. Invalid or oversized sign arguments are skipped with a warning and an `invalid_sign_requests` counter.
+- Frames and Borsh messages are capped at 16 MiB. Each Borsh message permits at most 16,384 collection items, including nested collections; strings allow up to 1 MiB of UTF-8 bytes. Sign arguments allow 16 KiB. Receipt-only responses must not include chunk parts. These are watcher limits, not NEAR protocol limits.
 
 ## Develop
 
 ```sh
+vp fmt
 vp check
 vp test run
-vp fmt
 ```
 
-The code has six modules in `src/`:
+CI runs the same formatting, lint, type and test checks. Tests use a local TCP peer and fixed captures; they do not need a testnet connection.
 
-- `schemas.ts`: native Effect schemas, with Zorsh annotations for Borsh widths and layouts.
-- `protocol.ts`: bounded codecs, framing, signatures and receipt commitment checks.
+The six modules in `src/` separate the wire format, networking and MPC interpretation:
+
+- `schemas.ts`: Effect schemas with Zorsh's explicit Borsh layouts and bounds.
+- `protocol.ts`: codecs, framing, signatures and receipt commitment checks.
 - `peer.ts`: one authenticated TCP peer and its scoped socket lifetime.
-- `network.ts`: bootstrap, peer connections and an Effect stream of receipts for an account.
-- `mpc.ts`: `sign` arguments, per-action deduplication and MPC metrics.
+- `network.ts`: bootstrap, peer connections and an Effect receipt stream for an account.
+- `mpc.ts`: sign arguments, per-action deduplication and MPC metrics.
 - `watch.ts`: CLI configuration and output.
 
-To watch another account, consume the network stream directly:
+To observe receipts for another testnet account, use the network stream directly:
 
 ```ts
 import { Console, Effect, Stream } from "effect";
@@ -109,12 +129,12 @@ await Effect.runPromise(
 );
 ```
 
-Each observation includes the raw decoded receipt, block height, source peer and local timing. Peers may report the same receipt. The MPC consumer deduplicates by receipt ID and action index for up to ten minutes, retaining at most 4,096 entries per subscription. The network layer does not interpret function arguments.
+The network stream includes the decoded receipt, block height, source peer and local timing. It does not interpret function arguments or deduplicate observations across peers.
 
-Synthetic fixtures use the same native Effect schemas as the decoder. Seeded `Arbitrary.schema` tests generate sign actions, hashes and fixed-length signature arrays, then round-trip their wire encoding. The fixture builders compute the dependent receipt, chunk and block hashes. The two captured files in `fixtures/` stay fixed: their hashes and exact round trips catch compatibility mistakes that a generated fixture could share with the decoder. Add captures when supporting new wire versions; do not regenerate the historical ones.
+Synthetic test data is generated from the shared schemas. The two binary files in `fixtures/` are frozen testnet captures with hash and exact-byte round-trip assertions. They provide an independent compatibility check; do not regenerate them from the schemas.
 
-Uses Effect 4 and near-kit for bootstrap. `protobufjs` reads the pinned [nearcore](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) schema in `vendor/`. Zorsh decodes the Borsh schemas with `maxBytes` and `maxItems`; explicit `Borsh.maxLength` checks reject oversized strings and unwanted vectors at their length prefixes. Ordinary Effect length checks run after decoding. `withBytes` retains the received receipt, header and body bytes for proof hashes, while prefix decoding separates routing headers from their bodies. There is no custom Borsh cursor or schema walker.
+Uses published `@zorsh/effect` 0.1.0, Effect 4, near-kit for RPC bootstrap, and protobufjs for NEAR's network envelope. Zorsh handles Borsh bounds, prefix decoding and original byte spans; there is no custom Borsh parser.
 
-The trial tarball was built from unmodified commit `c8be68c8f0fb2b3ef24a19029705bd0cb66e47ac` with `vp -C packages/effect pack` and `vp -C packages/effect pm pack`, using the existing frozen-lockfile install. It includes the upstream MIT license. Its SHA-256 is `74b0388eab2ce1149aa9fbec815c92670f316cd14f620800976b3d904afffd9e`.
+## License
 
-`WireString` is `Schema.String.check(Borsh.maxLength(1_048_576))`. Zorsh checks its byte limit before UTF-8 decoding, preserves leading BOMs and rejects lone UTF-16 surrogates on encode. The layouts are fixed and nonrecursive. Tests build captured fields from typed values and their schema encoding, so `withBytes` also checks that those values and bytes agree.
+[MIT](LICENSE). The vendored protobuf schema comes from [nearcore at `44f7ae6`](https://github.com/near/nearcore/tree/44f7ae6cd7ef08bab604e20a473bf77e35d4c993) and retains its [MIT license](vendor/LICENSE-MIT).
